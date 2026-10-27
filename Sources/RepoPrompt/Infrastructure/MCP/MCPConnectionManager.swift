@@ -587,11 +587,32 @@ actor ServerNetworkManager {
             if let helperPeerPID {
                 bootstrapPeerPIDByConnectionID[connectionID] = helperPeerPID
             }
-            if let helperPeerStartSeconds, let helperPeerStartMicroseconds {
-                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
+            // Captured through the production snapshot path from a one-entry process table that
+            // knows only the fixture peer (its parent is unknown, so no ancestry is recorded). The
+            // watchdog proof falls back to a live query when the snapshot lacks an agent PID, and
+            // the helper-exit watch never treats a missing ancestor as proof.
+            if let helperPeerPID, let helperPeerStartSeconds, let helperPeerStartMicroseconds {
+                let peer = MCPHelperProcessIdentity(
+                    pid: pid_t(helperPeerPID),
                     startSeconds: helperPeerStartSeconds,
                     startMicroseconds: helperPeerStartMicroseconds
                 )
+                if let snapshot = MCPHelperPeerProcessSnapshot.capture(
+                    peerPID: peer.pid,
+                    reader: DebugSingleProcessTableReader(entryPID: peer.pid, identity: peer)
+                ) {
+                    helperPeerProcessSnapshotByConnectionID[connectionID] = snapshot
+                }
+            }
+        }
+
+        /// A process table containing one process whose parent is launchd.
+        private struct DebugSingleProcessTableReader: MCPProcessTableReading {
+            let entryPID: pid_t
+            let identity: MCPHelperProcessIdentity
+
+            func entry(for pid: pid_t) -> MCPProcessTableEntry {
+                pid == entryPID ? .present(identity: identity, parentPID: 1, isZombie: false) : .absent
             }
         }
 
@@ -1211,13 +1232,13 @@ actor ServerNetworkManager {
             let executableIdentity: ExecutableFileIdentity?
         }
 
-        private struct DebugHelperPeerIdentity {
-            let startSeconds: Int64
-            let startMicroseconds: Int32
-        }
-
         private var debugExpectedProcessIdentityByRunID: [UUID: [pid_t: DebugExpectedProcessIdentity]] = [:]
-        private var debugHelperPeerIdentityByConnectionID: [UUID: DebugHelperPeerIdentity] = [:]
+        /// Manual helper-exit watch ticks (no polling task) and a test clock offset.
+        private var debugHelperExitWatchManualTicks = false
+        private var debugHelperExitWatchClockOffset: Duration = .zero
+        private var debugHelperExitGenerationGuardRejections = 0
+        /// Test-only destination for accepted-socket terminal records.
+        private var debugTerminalRecordsDirectoryOverride: URL?
         private var debugLiveRunMappedOMPIdentityConnections: Set<UUID> = []
         private var debugOMPProcessCorrelationFieldsByConnectionIDForTesting: [UUID: [String: String]] = [:]
         private let debugQualificationRawIngress = OMPQualificationRawIngressRecorder()
@@ -1229,6 +1250,15 @@ actor ServerNetworkManager {
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var bootstrapPeerPIDByConnectionID: [UUID: Int] = [:]
+    /// The helper peer's process identity and ancestor chain, captured at admission while it is
+    /// alive (same key set as `bootstrapPeerPIDByConnectionID` when the peer was readable).
+    private var helperPeerProcessSnapshotByConnectionID: [UUID: MCPHelperPeerProcessSnapshot] = [:]
+    private var helperProcessTableReader: any MCPProcessTableReading = MCPSystemProcessTableReader()
+    /// Pending helper-exit observations (see `openHelperExitObservationIfEligible`).
+    private var helperExitObservations: [UUID: HelperExitObservation] = [:]
+    private var helperExitPollingTask: Task<Void, Never>?
+    private var helperExitPollingTaskID: UUID?
+    private var helperExitWatchTickNanoseconds: UInt64 = 1_000_000_000
     private var terminalRecordClaimsByConnectionID: [UUID: MCPFirstTerminalRecordClaim] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -1343,6 +1373,21 @@ actor ServerNetworkManager {
     }
 
     private var toolEventObservers: [UUID: [UUID: ToolEventObserver]] = [:]
+    /// Run-scoped observers of app-initiated connection loss (`AgentMCPRunConnectionLoss`).
+    private struct RunConnectionLossObserverRegistration {
+        let launch: AgentMCPRunLaunchIdentity
+        /// The launch's agent process instance (PID plus start time) read when the observer
+        /// registered, so a later process that reuses the PID never proves ownership. `nil` when
+        /// the process table could not be read then: the watchdog falls back to PID-only proof and
+        /// the helper-exit watch never addresses the launch.
+        let agentIdentity: MCPHelperProcessIdentity?
+        /// Connections that already existed when this launch registered: never this launch's own
+        /// helper unless its agent PID is proven.
+        let preexistingConnectionIDs: Set<UUID>
+        let observer: @Sendable (AgentMCPRunConnectionLoss) async -> Void
+    }
+
+    private var runConnectionLossObservers: [UUID: [UUID: RunConnectionLossObserverRegistration]] = [:]
     private var toolObserverUnregistrationsByRunID: [UUID: ToolObserverUnregistrationState] = [:]
     #if DEBUG
         private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
@@ -3205,7 +3250,7 @@ actor ServerNetworkManager {
             return nil
         }
 
-        runIDByConnectionID[connectionID] = resolved.runID
+        assignRunRoute(resolved.runID, to: connectionID)
         windowIDByRunID[resolved.runID] = resolved.windowID
         return resolved.runID
     }
@@ -3293,7 +3338,7 @@ actor ServerNetworkManager {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
             }
             if persistWindowBinding {
-                runIDByConnectionID[connectionID] = runID
+                assignRunRoute(runID, to: connectionID)
             }
             windowIDByRunID[runID] = windowID
             return true
@@ -3326,7 +3371,7 @@ actor ServerNetworkManager {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
         windowIDByRunID[runID] = windowID
         updateLiveRunAffinity(
@@ -3378,7 +3423,7 @@ actor ServerNetworkManager {
         if connectionWindowMap[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
-        runIDByConnectionID[connectionID] = runID
+        assignRunRoute(runID, to: connectionID)
         windowIDByRunID[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
@@ -3674,7 +3719,7 @@ actor ServerNetworkManager {
         runPurposeByConnection[connectionID] = cached.purpose
         preassignedConnections.insert(connectionID)
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
 
         if persistWindowBinding, connectionWindowMap[connectionID] != cached.windowID {
@@ -3864,6 +3909,462 @@ actor ServerNetworkManager {
 
         if let unregistration = toolObserverUnregistrationsByRunID[runID] {
             await unregistration.task.value
+        }
+    }
+
+    // MARK: - Run Connection-Loss Observers
+
+    @discardableResult
+    func registerRunConnectionLossObserver(
+        for runID: UUID,
+        launch: AgentMCPRunLaunchIdentity,
+        observer: @escaping @Sendable (AgentMCPRunConnectionLoss) async -> Void
+    ) -> UUID {
+        let token = UUID()
+        let agentIdentity: MCPHelperProcessIdentity? = switch helperProcessTableReader.entry(for: launch.agentProcessID) {
+        case let .present(identity, _, isZombie):
+            isZombie ? nil : identity
+        case .absent, .unreadable:
+            nil
+        }
+        if agentIdentity == nil {
+            connectionLog("Run connection-loss observer for run=\(runID) launch=\(launch.token): agent pid=\(launch.agentProcessID) identity unreadable; watchdog proof falls back to PID only and the helper-exit watch will not address this launch")
+        }
+        runConnectionLossObservers[runID, default: [:]][token] = RunConnectionLossObserverRegistration(
+            launch: launch,
+            agentIdentity: agentIdentity,
+            preexistingConnectionIDs: Set(connections.keys).union(bootstrapPeerPIDByConnectionID.keys),
+            observer: observer
+        )
+        return token
+    }
+
+    func unregisterRunConnectionLossObserver(for runID: UUID, token: UUID) {
+        if var observers = runConnectionLossObservers[runID] {
+            observers.removeValue(forKey: token)
+            runConnectionLossObservers[runID] = observers.isEmpty ? nil : observers
+        }
+        // Pending helper-exit observations stop addressing the unregistered launch; one left with
+        // no addressees is cancelled.
+        for (observationID, var observation) in helperExitObservations where observation.runID == runID {
+            observation.addressees.removeAll { $0.observerToken == token }
+            if observation.addressees.isEmpty {
+                retireHelperExitObservation(observationID, outcome: "no_addressees")
+            } else {
+                helperExitObservations[observationID] = observation
+            }
+        }
+        stopHelperExitWatchPollingIfIdle()
+    }
+
+    private typealias RunConnectionLossDelivery = (
+        observer: @Sendable (AgentMCPRunConnectionLoss) async -> Void,
+        loss: AgentMCPRunConnectionLoss
+    )
+
+    /// The one loss builder for every reason: an immutable event addressed to `registration`'s
+    /// launch with the ownership evidence the caller proved.
+    private func runConnectionLossDelivery(
+        registration: RunConnectionLossObserverRegistration,
+        runID: UUID,
+        connectionID: UUID,
+        clientName: String?,
+        provenAgentProcessID: pid_t?,
+        toolName: String?,
+        reason: AgentMCPRunConnectionLoss.Reason,
+        closeReason: String
+    ) -> RunConnectionLossDelivery {
+        let loss = AgentMCPRunConnectionLoss(
+            runID: runID,
+            connectionID: connectionID,
+            clientName: clientName,
+            launchToken: registration.launch.token,
+            agentProcessID: provenAgentProcessID,
+            connectionPredatesLaunch: registration.preexistingConnectionIDs.contains(connectionID),
+            toolName: toolName,
+            reason: reason,
+            closeReason: closeReason
+        )
+        return (observer: registration.observer, loss: loss)
+    }
+
+    /// Watchdog ownership proof: whether the registration's agent process is in the connection's
+    /// helper ancestry. The admission snapshot decides when it contains the agent PID (so a
+    /// reparented or exited helper still proves its spawner), and then requires the same process
+    /// instance (start time) captured at registration, so a recycled PID never proves ownership.
+    /// When the snapshot is missing or lacks the PID, a live ancestry query decides. When the
+    /// agent identity could not be read at registration, proof falls back to the PID alone.
+    private func watchdogAncestryProves(
+        registration: RunConnectionLossObserverRegistration,
+        connectionID: UUID
+    ) -> Bool {
+        let agentPID = registration.launch.agentProcessID
+        let admission = helperPeerProcessSnapshotByConnectionID[connectionID]
+        if let captured = admission?.chainIdentity(of: agentPID) {
+            guard let agent = registration.agentIdentity else { return true }
+            return captured == agent
+        }
+        guard let peerPID = bootstrapPeerPIDByConnectionID[connectionID] else { return false }
+        guard let admission else {
+            guard let agent = registration.agentIdentity else {
+                return isAncestor(expectedPIDs: [agentPID], ofPid: pid_t(peerPID))
+            }
+            return MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(peerPID), reader: helperProcessTableReader)?
+                .chainContains(agent) ?? false
+        }
+        // The admission snapshot lacks the agent PID. A live query decides only while it still
+        // describes the helper process instance the snapshot captured: a recycled helper PID
+        // proves nothing.
+        guard let live = MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(peerPID), reader: helperProcessTableReader),
+              live.peer == admission.peer
+        else { return false }
+        guard let agent = registration.agentIdentity else {
+            return live.chainIdentity(of: agentPID) != nil
+        }
+        return live.chainContains(agent)
+    }
+
+    /// One addressed loss event per launch observer registered for the connection's run, for a
+    /// connection the execution watchdog is about to sever. Synchronous so the run route, the
+    /// observer set and each launch's ownership evidence are captured before the abort's first
+    /// suspension: later removal, reentrant routing or a successor launch's registration cannot
+    /// change them.
+    private func executionWatchdogRunConnectionLosses(
+        connectionID: UUID,
+        toolName: String,
+        callTimeRunID: UUID?
+    ) -> [RunConnectionLossDelivery] {
+        guard let runID = runIDByConnectionID[connectionID] ?? callTimeRunID,
+              let registrations = runConnectionLossObservers[runID]?.values
+        else { return [] }
+        let clientName = clientIDByConnection[connectionID]
+        return registrations.map { registration in
+            let launchPID = registration.launch.agentProcessID
+            let proven = watchdogAncestryProves(registration: registration, connectionID: connectionID)
+            return runConnectionLossDelivery(
+                registration: registration,
+                runID: runID,
+                connectionID: connectionID,
+                clientName: clientName,
+                provenAgentProcessID: proven ? launchPID : nil,
+                toolName: toolName,
+                reason: .toolExecutionWatchdog,
+                closeReason: TerminationReason.toolExecutionWatchdog.rawValue
+            )
+        }
+    }
+
+    // MARK: - Helper-Exit Watch
+
+    /// First terminal close reasons that never open a helper-exit watch: orderly run teardown,
+    /// manager shutdown (in-process MCP server restarts are out of scope), a replacement that
+    /// already routes the run, and the watchdog (which reports its own loss). Every other reason,
+    /// including unknown or future ones, is watched.
+    nonisolated static let helperExitWatchExcludedCloseReasons: Set<String> = [
+        TerminationReason.runCompleted.rawValue,
+        TerminationReason.runCancelled.rawValue,
+        TerminationReason.serverShutdown.rawValue,
+        TerminationReason.connectionReplaced.rawValue,
+        TerminationReason.toolExecutionWatchdog.rawValue
+    ]
+    /// An exited helper is reported only after this grace, so a Claude crash (which also kills
+    /// the helper) reaches the controller first. While a matching successor connection is
+    /// accepted but not yet routed, the wait extends to `helperRouteRestoreDeadline`.
+    nonisolated static let helperExitGrace: Duration = .seconds(2)
+    /// A helper that stays alive must restore the run route within this deadline.
+    nonisolated static let helperRouteRestoreDeadline: Duration = .seconds(20)
+
+    private struct HelperExitObservationAddressee {
+        let observerToken: UUID
+        let launch: AgentMCPRunLaunchIdentity
+        /// The launch's agent process instance as captured in the helper's admission ancestry.
+        let provenAgent: MCPHelperProcessIdentity
+    }
+
+    /// A closed run-routed helper connection whose helper process is being watched.
+    private struct HelperExitObservation {
+        let id: UUID
+        let connectionID: UUID
+        let runID: UUID
+        let sessionToken: String?
+        let clientName: String?
+        let closeReason: String
+        let helper: MCPHelperPeerProcessSnapshot
+        let openedAt: ContinuousClock.Instant
+        var addressees: [HelperExitObservationAddressee]
+    }
+
+    private func helperExitWatchNow() -> ContinuousClock.Instant {
+        #if DEBUG
+            return ContinuousClock.now.advanced(by: debugHelperExitWatchClockOffset)
+        #else
+            return ContinuousClock.now
+        #endif
+    }
+
+    /// Records a bootstrap helper peer and captures its process snapshot synchronously, while it
+    /// is alive.
+    private func setBootstrapPeerPID(_ pid: Int, for connectionID: UUID) {
+        bootstrapPeerPIDByConnectionID[connectionID] = pid
+        if let snapshot = MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(pid), reader: helperProcessTableReader) {
+            helperPeerProcessSnapshotByConnectionID[connectionID] = snapshot
+        } else {
+            helperPeerProcessSnapshotByConnectionID.removeValue(forKey: connectionID)
+        }
+    }
+
+    /// The single write path for a connection's run route. A route that becomes authoritative for
+    /// a run cancels that run's pending helper-exit observations it supersedes.
+    private func assignRunRoute(_ runID: UUID, to connectionID: UUID) {
+        runIDByConnectionID[connectionID] = runID
+        guard !helperExitObservations.isEmpty else { return }
+        for observation in helperExitObservations.values
+            where observation.runID == runID && isQualifyingHelperExitSuccessor(connectionID, for: observation)
+        {
+            retireHelperExitObservation(observation.id, outcome: "superseded successor=\(connectionID)")
+        }
+        stopHelperExitWatchPollingIfIdle()
+    }
+
+    /// A successor cancels an observation only once its run route for the same run is in place and
+    /// it is provably the same agent's helper: the same helper session token, or an admission
+    /// ancestry containing the same agent process instance. A merely accepted socket, or another
+    /// launch's helper, does not.
+    private func isQualifyingHelperExitSuccessor(
+        _ candidateID: UUID,
+        for observation: HelperExitObservation
+    ) -> Bool {
+        runIDByConnectionID[candidateID] == observation.runID
+            && isLiveMatchingHelperCandidate(candidateID, for: observation)
+    }
+
+    /// The route-independent half of both successor checks: a live, non-terminal connection other
+    /// than the observed one that is provably the observed agent's helper (the same helper session
+    /// token, or an admission ancestry containing an addressed agent process instance).
+    private func isLiveMatchingHelperCandidate(
+        _ candidateID: UUID,
+        for observation: HelperExitObservation
+    ) -> Bool {
+        guard candidateID != observation.connectionID,
+              connections[candidateID] != nil,
+              !connectionsBeingRemoved.contains(candidateID),
+              terminalRecordClaimsByConnectionID[candidateID] == nil,
+              !executionWatchdogTerminalConnections.contains(candidateID)
+        else { return false }
+        if let token = observation.sessionToken, sessionToken(for: candidateID) == token {
+            return true
+        }
+        guard let snapshot = helperPeerProcessSnapshotByConnectionID[candidateID] else { return false }
+        return observation.addressees.contains { snapshot.chainContains($0.provenAgent) }
+    }
+
+    private func helperExitObservationSuccessor(_ observation: HelperExitObservation) -> UUID? {
+        runIDByConnectionID.first { candidateID, runID in
+            runID == observation.runID && isQualifyingHelperExitSuccessor(candidateID, for: observation)
+        }?.key
+    }
+
+    /// A live connection that matches the observation's helper (same session token, or admission
+    /// ancestry containing an addressed agent instance) but has no run route yet: its admission
+    /// may still restore the route, so an exited helper is not reported before the route deadline.
+    private func helperExitObservationHasPendingUnroutedSuccessor(_ observation: HelperExitObservation) -> Bool {
+        connections.keys.contains { candidateID in
+            runIDByConnectionID[candidateID] == nil
+                && isLiveMatchingHelperCandidate(candidateID, for: observation)
+        }
+    }
+
+    /// Opens a helper-exit observation at a bootstrap helper connection's first terminal commit,
+    /// synchronously (before any suspension, while the run route is intact). Only a run-routed
+    /// connection of a run with loss observers, closed for a watched reason by a running manager,
+    /// and not a watchdog abort, is watched; only launches whose agent PID is in the helper's
+    /// admission ancestry are addressed.
+    private func openHelperExitObservationIfEligible(connectionID: UUID, closeReason: String) {
+        guard isRunningState,
+              !Self.helperExitWatchExcludedCloseReasons.contains(closeReason),
+              !executionWatchdogTerminalConnections.contains(connectionID),
+              bootstrapPeerPIDByConnectionID[connectionID] != nil,
+              let runID = runIDByConnectionID[connectionID],
+              let registrations = runConnectionLossObservers[runID],
+              !registrations.isEmpty
+        else { return }
+        // Production bootstrap registration always records the current generation
+        // (`registerAndStartBootstrapConnection`), so a mismatch on a routed, observed connection
+        // is unexpected: say so rather than silently disabling the watch.
+        guard connectionLifecycleGenerationByID[connectionID] == lifecycleGeneration else {
+            #if DEBUG
+                debugHelperExitGenerationGuardRejections += 1
+            #endif
+            log.warning("Helper-exit watch not opened: lifecycle generation mismatch connection=\(connectionID) run=\(runID) connection_generation=\(connectionLifecycleGenerationByID[connectionID].map { String($0) } ?? "none") manager_generation=\(lifecycleGeneration) close_reason=\(closeReason) observers=\(registrations.count)")
+            return
+        }
+        guard let helper = helperPeerProcessSnapshotByConnectionID[connectionID] else {
+            connectionLog("Helper-exit watch not opened: no admission process snapshot connection=\(connectionID) run=\(runID) close_reason=\(closeReason)")
+            return
+        }
+        var addressees: [HelperExitObservationAddressee] = []
+        for (observerToken, registration) in registrations {
+            // Proof requires the agent process instance read at registration (PID plus start
+            // time) in the admission ancestry; a recycled PID or an unreadable identity is no proof.
+            guard let agent = registration.agentIdentity, helper.chainContains(agent) else {
+                connectionLog("Helper-exit watch: launch \(registration.launch.token) agent_pid=\(registration.launch.agentProcessID) agent_start=\(registration.agentIdentity?.startDescription ?? "unknown") has no ancestry proof for connection=\(connectionID) run=\(runID); it gets no event")
+                continue
+            }
+            addressees.append(HelperExitObservationAddressee(
+                observerToken: observerToken,
+                launch: registration.launch,
+                provenAgent: agent
+            ))
+        }
+        guard !addressees.isEmpty else {
+            connectionLog("Helper-exit watch not opened: no launch proven for connection=\(connectionID) run=\(runID) close_reason=\(closeReason)")
+            return
+        }
+        let observation = HelperExitObservation(
+            id: UUID(),
+            connectionID: connectionID,
+            runID: runID,
+            sessionToken: sessionToken(for: connectionID),
+            clientName: clientIDByConnection[connectionID] ?? pendingConnections[connectionID],
+            closeReason: closeReason,
+            helper: helper,
+            openedAt: helperExitWatchNow(),
+            addressees: addressees
+        )
+        helperExitObservations[observation.id] = observation
+        connectionLog("Helper-exit watch opened observation=\(observation.id) connection=\(connectionID) run=\(runID) close_reason=\(closeReason) helper_pid=\(helper.peer.pid) helper_start=\(helper.peer.startDescription) addressees=\(addressees.count)")
+        ensureHelperExitWatchPolling()
+    }
+
+    private func retireHelperExitObservation(_ observationID: UUID, outcome: String) {
+        guard let observation = helperExitObservations.removeValue(forKey: observationID) else { return }
+        connectionLog("Helper-exit watch retired observation=\(observationID) connection=\(observation.connectionID) run=\(observation.runID) outcome=\(outcome)")
+    }
+
+    /// One pass over pending observations. Synchronous: each observation's final validation (no
+    /// successor, current addressees), loss construction and retirement happen with no suspension
+    /// in between; delivery is detached. Returns the number of losses delivered.
+    @discardableResult
+    private func runHelperExitWatchTick() -> Int {
+        guard !helperExitObservations.isEmpty else { return 0 }
+        let now = helperExitWatchNow()
+        var deliveries: [RunConnectionLossDelivery] = []
+        for observation in helperExitObservations.values.sorted(by: { $0.openedAt < $1.openedAt }) {
+            if let successorID = helperExitObservationSuccessor(observation) {
+                retireHelperExitObservation(observation.id, outcome: "superseded successor=\(successorID)")
+                continue
+            }
+            let registrations = runConnectionLossObservers[observation.runID] ?? [:]
+            let current = observation.addressees.compactMap { addressee -> (
+                addressee: HelperExitObservationAddressee,
+                registration: RunConnectionLossObserverRegistration
+            )? in
+                guard let registration = registrations[addressee.observerToken],
+                      registration.launch == addressee.launch
+                else { return nil }
+                return (addressee, registration)
+            }
+            guard !current.isEmpty else {
+                retireHelperExitObservation(observation.id, outcome: "no_addressees")
+                continue
+            }
+            let elapsed = observation.openedAt.duration(to: now)
+            let liveness = MCPHelperProcessLiveness.classify(observation.helper.peer, reader: helperProcessTableReader)
+            let reason: AgentMCPRunConnectionLoss.Reason
+            switch liveness {
+            case .exited:
+                guard elapsed >= Self.helperExitGrace else { continue }
+                if elapsed < Self.helperRouteRestoreDeadline,
+                   helperExitObservationHasPendingUnroutedSuccessor(observation)
+                {
+                    continue
+                }
+                reason = .helperExited
+            case .alive, .unknown:
+                guard elapsed >= Self.helperRouteRestoreDeadline else { continue }
+                reason = .routeNotRestored
+            }
+            for entry in current {
+                deliveries.append(runConnectionLossDelivery(
+                    registration: entry.registration,
+                    runID: observation.runID,
+                    connectionID: observation.connectionID,
+                    clientName: observation.clientName,
+                    provenAgentProcessID: entry.addressee.provenAgent.pid,
+                    toolName: nil,
+                    reason: reason,
+                    closeReason: observation.closeReason
+                ))
+            }
+            retireHelperExitObservation(observation.id, outcome: "\(reason.rawValue) liveness=\(liveness) losses=\(current.count)")
+        }
+        stopHelperExitWatchPollingIfIdle()
+        deliverRunConnectionLosses(deliveries)
+        return deliveries.count
+    }
+
+    /// Starts the single manager-owned poller while observations exist. It sleeps with
+    /// `Task.sleep(nanoseconds:)`, holds only a weak manager reference across sleeps, and ends
+    /// when the observations drain, the manager stops, or its lifecycle is invalidated.
+    private func ensureHelperExitWatchPolling() {
+        guard helperExitPollingTask == nil, !helperExitObservations.isEmpty else { return }
+        #if DEBUG
+            if debugHelperExitWatchManualTicks { return }
+        #endif
+        let pollerID = UUID()
+        let interval = helperExitWatchTickNanoseconds
+        let generation = lifecycleGeneration
+        helperExitPollingTaskID = pollerID
+        helperExitPollingTask = Task { [weak self] in
+            while true {
+                do {
+                    try await Task.sleep(nanoseconds: interval)
+                } catch {
+                    return
+                }
+                guard let manager = self,
+                      await manager.helperExitWatchPollerTick(pollerID: pollerID, lifecycleGeneration: generation)
+                else { return }
+            }
+        }
+    }
+
+    /// Returns whether the poller identified by `pollerID` should keep running.
+    private func helperExitWatchPollerTick(pollerID: UUID, lifecycleGeneration generation: UInt64) -> Bool {
+        guard helperExitPollingTaskID == pollerID, !Task.isCancelled else { return false }
+        guard isCurrentLifecycle(generation) else {
+            cancelHelperExitWatch()
+            return false
+        }
+        runHelperExitWatchTick()
+        return helperExitPollingTaskID == pollerID
+    }
+
+    private func stopHelperExitWatchPollingIfIdle() {
+        guard helperExitObservations.isEmpty, helperExitPollingTask != nil else { return }
+        helperExitPollingTask?.cancel()
+        helperExitPollingTask = nil
+        helperExitPollingTaskID = nil
+    }
+
+    /// Manager stop / lifecycle invalidation: drop every observation and stop the poller.
+    private func cancelHelperExitWatch() {
+        if !helperExitObservations.isEmpty {
+            connectionLog("Helper-exit watch cancelled \(helperExitObservations.count) observation(s): manager lifecycle ended")
+        }
+        helperExitObservations.removeAll()
+        helperExitPollingTask?.cancel()
+        helperExitPollingTask = nil
+        helperExitPollingTaskID = nil
+    }
+
+    /// Fire-and-forget: each observer runs in its own detached task, so a slow or stuck observer
+    /// can never delay containment or another observer.
+    private func deliverRunConnectionLosses(_ deliveries: [RunConnectionLossDelivery]) {
+        for delivery in deliveries {
+            let observer = delivery.observer
+            let loss = delivery.loss
+            Task.detached { await observer(loss) }
         }
     }
 
@@ -5336,6 +5837,17 @@ actor ServerNetworkManager {
             return admission
         }
 
+        /// Enters the running state and activates the transferred-socket ledger exactly as
+        /// `start()` does, without starting the bootstrap listener or the maintenance loop, so a
+        /// test can drive the production bootstrap admission/commit with a socketpair.
+        func debugEnterRunningStateWithoutListenersForTesting() {
+            if !isRunningState {
+                lifecycleGeneration &+= 1
+            }
+            isRunningState = true
+            transferredBootstrapSockets.activate(lifecycleGeneration: lifecycleGeneration)
+        }
+
         func debugContainsConnection(_ id: UUID) -> Bool {
             connections[id] != nil
         }
@@ -5411,15 +5923,7 @@ actor ServerNetworkManager {
         mcpACPLog("[MCP-ACP] registered bootstrap connection connection=\(connectionID) pendingClientName=\(clientName ?? "unknown")")
 
         connections[connectionID] = manager
-        bootstrapPeerPIDByConnectionID[connectionID] = clientPid
-        #if DEBUG
-            if let peerIdentity = processIdentity(of: pid_t(clientPid)) {
-                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
-                    startSeconds: peerIdentity.startSeconds,
-                    startMicroseconds: peerIdentity.startMicroseconds
-                )
-            }
-        #endif
+        setBootstrapPeerPID(clientPid, for: connectionID)
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
@@ -5834,6 +6338,7 @@ actor ServerNetworkManager {
         bootstrapSocketTask = nil
         maintenanceTask?.cancel()
         maintenanceTask = nil
+        cancelHelperExitWatch()
 
         // Invalidate synchronous transfer publication and close transferred-but-unregistered
         // sockets before awaiting listener teardown. This prevents old-lifecycle commits
@@ -5865,9 +6370,7 @@ actor ServerNetworkManager {
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
-            #if DEBUG
-                debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
-            #endif
+            helperPeerProcessSnapshotByConnectionID.removeValue(forKey: id)
             connectionTasks.removeValue(forKey: id)
             pendingConnections.removeValue(forKey: id)
             identityContextByConnection.removeValue(forKey: id)
@@ -5934,6 +6437,11 @@ actor ServerNetworkManager {
                     )
                 }
             }
+        }
+        // Belt and braces: shutdown awaited above. Unless a replacement lifecycle started meanwhile,
+        // no helper-exit observation or poller may survive this stop.
+        if !isRunningState {
+            cancelHelperExitWatch()
         }
         emitDashboardUpdate()
     }
@@ -6303,13 +6811,25 @@ actor ServerNetworkManager {
             errno: context.errno,
             errorDescription: context.errorDescription
         )
+        let isFirstTerminalCommit = terminalRecordClaimsByConnectionID[connectionID] == nil
         var claim = terminalRecordClaimsByConnectionID[connectionID] ?? MCPFirstTerminalRecordClaim()
         guard let record = claim.claim(candidate) else { return }
         terminalRecordClaimsByConnectionID[connectionID] = claim
+        if isFirstTerminalCommit {
+            // Every terminal path commits here first, synchronously and while the run route is
+            // intact, so the first terminal reason decides whether the helper is watched.
+            openHelperExitObservationIfEligible(connectionID: connectionID, closeReason: record.reason)
+        }
 
+        let eventsDirectoryURL: URL
+        #if DEBUG
+            eventsDirectoryURL = debugTerminalRecordsDirectoryOverride ?? MCPFilesystemConstants.eventsDirectoryURL()
+        #else
+            eventsDirectoryURL = MCPFilesystemConstants.eventsDirectoryURL()
+        #endif
         if MCPTerminalRecordStore.writeBestEffort(
             record,
-            to: MCPFilesystemConstants.eventsDirectoryURL()
+            to: eventsDirectoryURL
         ) != nil {
             claim.markPersisted()
             terminalRecordClaimsByConnectionID[connectionID] = claim
@@ -6451,11 +6971,20 @@ actor ServerNetworkManager {
         _ id: UUID,
         toolName: String,
         invocationID: UUID,
+        callTimeRunID: UUID?,
         elapsedMilliseconds: Double,
         handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
         handlerPhaseAgeMilliseconds: Double?
     ) async {
         guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
+        // Captured and handed off right after the terminal commit, before any suspension (and
+        // before removal), so the owning run route and its launch observers are exact. Delivery is
+        // detached: observers learn of the loss and can never gate the abort below.
+        deliverRunConnectionLosses(executionWatchdogRunConnectionLosses(
+            connectionID: id,
+            toolName: toolName,
+            callTimeRunID: callTimeRunID
+        ))
         let activeToolExecutionScopeCount = activeToolScopeIDs(ownedBy: id).values.reduce(0) { $0 + $1.count }
         let limiterDiagnostics = await callLimiters[id]?.executionWatchdogDiagnostics()
         let phaseDescription = handlerPhase.map {
@@ -6773,8 +7302,8 @@ actor ServerNetworkManager {
         connections.removeValue(forKey: id)
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+        helperPeerProcessSnapshotByConnectionID.removeValue(forKey: id)
         #if DEBUG
-            debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
             debugLiveRunMappedOMPIdentityConnections.remove(id)
             debugOMPProcessCorrelationFieldsByConnectionIDForTesting.removeValue(forKey: id)
         #endif
@@ -8056,7 +8585,7 @@ actor ServerNetworkManager {
             purpose: MCPRunPurpose = .unknown,
             windowID: Int? = nil
         ) {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
             if purpose != .unknown || runPurposeByConnection[connectionID] == nil {
                 runPurposeByConnection[connectionID] = purpose
             }
@@ -8328,10 +8857,10 @@ actor ServerNetworkManager {
                     activeToolScopeCount: activeScopeCount,
                     helperPeerPID: connectionID.flatMap { bootstrapPeerPIDByConnectionID[$0] },
                     helperPeerStartSeconds: connectionID.flatMap {
-                        debugHelperPeerIdentityByConnectionID[$0]?.startSeconds
+                        helperPeerProcessSnapshotByConnectionID[$0]?.peer.startSeconds
                     },
                     helperPeerStartMicroseconds: connectionID.flatMap {
-                        debugHelperPeerIdentityByConnectionID[$0]?.startMicroseconds
+                        helperPeerProcessSnapshotByConnectionID[$0]?.peer.startMicroseconds
                     }
                 )
                 debugConnectionHistory.append(entry)
@@ -8387,6 +8916,7 @@ actor ServerNetworkManager {
                 let identity = identityContext(for: entry.id)
                 let clientName = identity?.clientName ?? clientIdentifier(forConnection: entry.id) ?? (entry.clientName.isEmpty ? nil : entry.clientName)
                 let fingerprint = debugSessionFingerprint(forToken: entry.sessionKey)
+                let helperSnapshot = helperPeerProcessSnapshotByConnectionID[entry.id]
                 return [
                     "id": entry.id.uuidString,
                     "client_name": clientName ?? NSNull(),
@@ -8399,9 +8929,12 @@ actor ServerNetworkManager {
                     "created_at_ms": debugDateMilliseconds(entry.createdAt),
                     "last_tool_call_at_ms": entry.lastToolCallAt.map(debugDateMilliseconds) ?? NSNull(),
                     "total_tool_calls": entry.totalToolCalls,
+                    "run_id": runIDByConnectionID[entry.id]?.uuidString ?? NSNull(),
                     "helper_peer_pid": bootstrapPeerPIDByConnectionID[entry.id] ?? NSNull(),
-                    "helper_peer_start_seconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startSeconds ?? NSNull(),
-                    "helper_peer_start_microseconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startMicroseconds ?? NSNull(),
+                    "helper_peer_start_seconds": helperSnapshot?.peer.startSeconds ?? NSNull(),
+                    "helper_peer_start_microseconds": helperSnapshot?.peer.startMicroseconds ?? NSNull(),
+                    "helper_process_start": helperSnapshot?.peer.startDescription ?? NSNull(),
+                    "helper_ancestor_pids": helperSnapshot.map { $0.ancestorPIDs.map(Int.init) as Any } ?? NSNull(),
                     "idle_seconds": entry.idleSeconds ?? NSNull(),
                     "has_in_flight_calls": entry.hasInFlightCalls,
                     "active_tool_scope_count": entry.activeToolScopeCount,
@@ -9891,6 +10424,110 @@ actor ServerNetworkManager {
             func debugIsExecutionWatchdogTerminal(connectionID: UUID) -> Bool {
                 executionWatchdogTerminalConnections.contains(connectionID)
             }
+
+            /// Seeds the bootstrap helper peer PID of a fixture connection (as admission records it).
+            func debugSetBootstrapPeerPID(connectionID: UUID, pid: pid_t) {
+                setBootstrapPeerPID(Int(pid), for: connectionID)
+            }
+
+            func debugSetTerminalRecordsDirectoryOverride(_ url: URL?) {
+                debugTerminalRecordsDirectoryOverride = url
+            }
+
+            func debugSetHelperProcessTableReader(_ reader: any MCPProcessTableReading) {
+                helperProcessTableReader = reader
+            }
+
+            /// Manual mode: observations never start the poller; tests drive `debugRunHelperExitWatchTick`.
+            func debugSetHelperExitWatchManualTicks(_ manual: Bool) {
+                debugHelperExitWatchManualTicks = manual
+            }
+
+            func debugSetHelperExitWatchTickNanoseconds(_ nanoseconds: UInt64) {
+                helperExitWatchTickNanoseconds = nanoseconds
+            }
+
+            func debugAdvanceHelperExitWatchClock(by duration: Duration) {
+                debugHelperExitWatchClockOffset += duration
+            }
+
+            @discardableResult
+            func debugRunHelperExitWatchTick() -> Int {
+                runHelperExitWatchTick()
+            }
+
+            func debugHelperExitObservationCount(runID: UUID? = nil) -> Int {
+                guard let runID else { return helperExitObservations.count }
+                return helperExitObservations.values.count(where: { $0.runID == runID })
+            }
+
+            func debugHelperExitObservationAddresseeTokens(connectionID: UUID) -> [UUID] {
+                helperExitObservations.values
+                    .filter { $0.connectionID == connectionID }
+                    .flatMap { $0.addressees.map(\.launch.token) }
+            }
+
+            var debugHelperExitWatchPollingActive: Bool {
+                helperExitPollingTask != nil
+            }
+
+            var debugHelperExitGenerationGuardRejectionCount: Int {
+                debugHelperExitGenerationGuardRejections
+            }
+
+            /// Drops a fixture connection's recorded lifecycle generation, simulating a registration
+            /// path that never wrote it.
+            func debugForgetConnectionLifecycleGeneration(_ connectionID: UUID) {
+                connectionLifecycleGenerationByID.removeValue(forKey: connectionID)
+            }
+
+            /// Runs one tick of the live poller as its task would, with its captured lifecycle
+            /// generation (`staleLifecycle` passes an earlier one). `nil` when no poller exists.
+            func debugRunHelperExitWatchPollerTick(staleLifecycle: Bool) -> Bool? {
+                guard let pollerID = helperExitPollingTaskID else { return nil }
+                let generation = staleLifecycle ? lifecycleGeneration &- 1 : lifecycleGeneration
+                return helperExitWatchPollerTick(pollerID: pollerID, lifecycleGeneration: generation)
+            }
+
+            func debugHelperPeerProcessSnapshot(connectionID: UUID) -> MCPHelperPeerProcessSnapshot? {
+                helperPeerProcessSnapshotByConnectionID[connectionID]
+            }
+
+            /// Commits a fixture connection's first terminal record (as every terminal path does)
+            /// without removing it.
+            func debugCommitTerminalRecordForTesting(connectionID: UUID, reason: String) {
+                persistAcceptedSocketTerminalRecord(
+                    connectionID: connectionID,
+                    context: MCPConnectionCloseContext(reason: reason, initiator: .app)
+                )
+            }
+
+            func debugConnectionIsRegistered(connectionID: UUID) -> Bool {
+                connections[connectionID] != nil
+            }
+
+            /// Drives the production soft disconnect (no kill signal, no session cooldown): the
+            /// helper keeps its session token and is expected to reconnect.
+            func debugSoftDisconnectConnection(connectionID: UUID, reason: TerminationReason) async {
+                await softDisconnectConnection(connectionID, reason: reason, message: "debug soft disconnect")
+            }
+
+            /// Drives the production execution-watchdog abort for a registered fixture connection.
+            func debugAbortConnectionForExecutionWatchdog(
+                connectionID: UUID,
+                toolName: String,
+                callTimeRunID: UUID? = nil
+            ) async {
+                await abortConnectionForExecutionWatchdog(
+                    connectionID,
+                    toolName: toolName,
+                    invocationID: UUID(),
+                    callTimeRunID: callTimeRunID,
+                    elapsedMilliseconds: 0,
+                    handlerPhase: nil,
+                    handlerPhaseAgeMilliseconds: nil
+                )
+            }
         #endif
 
         struct DebugActiveToolScopeSnapshot: Equatable {
@@ -10738,7 +11375,7 @@ actor ServerNetworkManager {
         cacheRunPolicyStateIfNeeded(policy)
         if let runID = policy.runID {
             admittedPolicyRunIDs.insert(runID)
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
         if let additional = policy.additionalTools {
             additionalToolsByConnection[connectionID] = additional
@@ -11115,7 +11752,7 @@ actor ServerNetworkManager {
                 windowAssignmentByConnection.removeValue(forKey: connectionID)
             }
             if let runID = restorePoint.runID {
-                runIDByConnectionID[connectionID] = runID
+                assignRunRoute(runID, to: connectionID)
             } else {
                 runIDByConnectionID.removeValue(forKey: connectionID)
             }
@@ -12559,7 +13196,8 @@ actor ServerNetworkManager {
                                 let executionTraceOrigin = await executionWatchdogEnvironment.now()
                                 let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
                                     origin: executionTraceOrigin,
-                                    now: { await executionWatchdogEnvironment.now() }
+                                    now: { await executionWatchdogEnvironment.now() },
+                                    synchronousNow: executionWatchdogEnvironment.synchronousNow
                                 )
 
                                 @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
@@ -12875,6 +13513,7 @@ actor ServerNetworkManager {
                                             connectionID,
                                             toolName: toolName,
                                             invocationID: invocationID,
+                                            callTimeRunID: observerRunIDForCallbacksFinal,
                                             elapsedMilliseconds: max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             handlerPhase: handlerPhase,
                                             handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds

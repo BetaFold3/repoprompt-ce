@@ -280,9 +280,18 @@ package actor AgentSessionDataService {
     /// Turns this process stamped `unknown` before launch evidence was captured, by session.
     private var provisionalUnknownStampTurnIDs: [UUID: Set<UUID>] = [:]
 
-    package init(tombstoneRoot: URL? = nil, recoveryStore: AgentRecoveryStore? = nil) {
+    /// Default `Workspaces` root for workspaces without a custom storage path, resolved once by
+    /// `WorkspaceStorageRoot` (an XCTest process gets its per-process temporary root).
+    private let workspacesRoot: URL
+
+    package init(
+        tombstoneRoot: URL? = nil,
+        recoveryStore: AgentRecoveryStore? = nil,
+        workspacesRoot: URL? = nil
+    ) {
         self.tombstoneRoot = tombstoneRoot ?? Self.defaultTombstoneRoot()
         self.recoveryStore = recoveryStore
+        self.workspacesRoot = WorkspaceStorageRoot.resolve(injected: workspacesRoot).url
     }
 
     private static func defaultTombstoneRoot() -> URL {
@@ -1358,7 +1367,15 @@ package actor AgentSessionDataService {
             entries: records.sortedForAgentSessionMetadataIndex(),
             quarantinedFiles: quarantinedFiles
         )
-        try? await writeMetadataIndex(index, folder: folder)
+        if files.isEmpty,
+           !FileManager.default.fileExists(atPath: metadataIndexFileURL(forAgentSessionsFolder: folder).path)
+        {
+            // No sessions and no index on disk: an empty index file would describe nothing, so
+            // keep it in memory only. The first saved session writes the index.
+            metadataIndexCacheByFolder[key] = index
+        } else {
+            try? await writeMetadataIndex(index, folder: folder)
+        }
         metadataIndexReconciledThisProcess.insert(key)
         #if DEBUG
             if let rebuildStartMS {
@@ -1453,7 +1470,8 @@ package actor AgentSessionDataService {
         for workspace: some AgentWorkspaceStorageReference,
         mode: AgentSessionMetadataIndexLoadMode
     ) async throws -> AgentSessionMetadataIndex? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        // A workspace that never saved a session has no folder: nothing to read, rebuild, or index.
+        guard let folder = agentSessionsFolderIfExists(for: workspace) else { return nil }
         switch mode {
         case .fast:
             return await readMetadataIndexIfAvailable(folder: folder)
@@ -1469,7 +1487,7 @@ package actor AgentSessionDataService {
     }
 
     package func fastMetadataRecordsIfAvailable(for workspace: some AgentWorkspaceStorageReference) async throws -> FastMetadataRecordsResult? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        guard let folder = agentSessionsFolderIfExists(for: workspace) else { return nil }
         let key = canonicalMetadataFolderKey(folder)
         if let cached = metadataIndexCacheByFolder[key] {
             guard cached.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
@@ -1507,7 +1525,7 @@ package actor AgentSessionDataService {
     }
 
     package func metadataRecordForSessionID(_ id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSessionMetadataRecord? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let folder = agentSessionsFolderURL(for: workspace)
         let fileURL = agentSessionFileURL(id: id, in: folder)
         guard try tombstoneState(for: id) == .absent,
               FileManager.default.fileExists(atPath: fileURL.path)
@@ -1537,7 +1555,7 @@ package actor AgentSessionDataService {
     }
 
     func sidebarStreamMetadataRecords(for workspace: some AgentWorkspaceStorageReference) async throws -> [AgentSessionMetadataRecord] {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        guard let folder = agentSessionsFolderIfExists(for: workspace) else { return [] }
         if let index = await readMetadataIndexIfAvailable(folder: folder) {
             scheduleMetadataIndexReconciliationIfNeeded(
                 folder: folder,
@@ -2191,7 +2209,7 @@ package actor AgentSessionDataService {
     ) async throws -> AgentSessionEditableLoad? {
         await acquireSessionPersistence(for: sessionID)
         defer { releaseSessionPersistence(for: sessionID) }
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let folder = agentSessionsFolderURL(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: folder)
         guard try !isCommittedTombstone(for: sessionID),
               FileManager.default.fileExists(atPath: fileURL.path)
@@ -2237,7 +2255,7 @@ package actor AgentSessionDataService {
                 releaseSessionPersistence(for: sessionID)
             }
         }
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let folder = agentSessionsFolderURL(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: folder)
         guard try !isCommittedTombstone(for: sessionID),
               FileManager.default.fileExists(atPath: fileURL.path)
@@ -3585,14 +3603,7 @@ package actor AgentSessionDataService {
 
     /// The workspace's session folder, resolved without creating anything.
     private func existingAgentSessionsFolder(for workspace: some AgentWorkspaceStorageReference) -> URL {
-        let base: URL = if let customURL = workspace.customStoragePath {
-            customURL
-        } else {
-            MCPFilesystemConstants.identity.applicationSupportRootURL()
-                .appendingPathComponent("Workspaces", isDirectory: true)
-                .appendingPathComponent(WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id))
-        }
-        return base.appendingPathComponent("AgentSessions")
+        agentSessionsFolderURL(for: workspace)
     }
 
     /// Index-only session metadata for the recovery catalog's schedule discovery (lossless restart
@@ -4123,7 +4134,7 @@ package actor AgentSessionDataService {
     }
 
     package func rawLastRunStateForAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> String? {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        let agentSessionsFolder = agentSessionsFolderURL(for: workspace)
         let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
         // Tombstoned residue is never read as a session, like the other lookups by ID.
         guard try tombstoneState(for: id) == .absent,
@@ -4392,7 +4403,7 @@ package actor AgentSessionDataService {
 
     /// Returns a list of AgentSession files in the workspace's AgentSessions folder, sorted by mod date desc.
     func listAgentSessions(for workspace: some AgentWorkspaceStorageReference) async throws -> [URL] {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        guard let agentSessionsFolder = agentSessionsFolderIfExists(for: workspace) else { return [] }
 
         let contents = try FileManager.default.contentsOfDirectory(
             at: agentSessionsFolder,
@@ -4554,7 +4565,7 @@ package actor AgentSessionDataService {
 
     /// Load an agent session by ID without scanning the session directory.
     package func loadAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSession? {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        let agentSessionsFolder = agentSessionsFolderURL(for: workspace)
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
@@ -4579,7 +4590,7 @@ package actor AgentSessionDataService {
             if let session = try await loadAgentSession(id: best.id, for: workspace) {
                 return session
             }
-            let folder = try ensureAgentSessionsFolder(for: workspace)
+            let folder = agentSessionsFolderURL(for: workspace)
             await removeMetadataRecords(matching: { $0.id == best.id }, folder: folder)
         }
 
@@ -4680,7 +4691,7 @@ package actor AgentSessionDataService {
         forComposeTabID tabID: UUID,
         for workspace: some AgentWorkspaceStorageReference
     ) async throws -> [AgentSessionDeletionCandidate] {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        guard let agentSessionsFolder = agentSessionsFolderIfExists(for: workspace) else { return [] }
         var candidateFilesByPath: [String: URL] = [:]
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
             for record in index.entries where record.composeTabID == tabID {
@@ -4783,7 +4794,8 @@ package actor AgentSessionDataService {
     }
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: some AgentWorkspaceStorageReference) async throws {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        // No folder means no session files and no index for this tab.
+        guard let agentSessionsFolder = agentSessionsFolderIfExists(for: workspace) else { return }
         var candidateFilesByPath: [String: URL] = [:]
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
             for record in index.entries where record.composeTabID == tabID {
@@ -4858,33 +4870,41 @@ package actor AgentSessionDataService {
 
     // MARK: - Folder Helpers
 
-    /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
-    private func ensureAgentSessionsFolder(for workspace: some AgentWorkspaceStorageReference) throws -> URL {
-        let baseFolder = try workspaceFolderURL(for: workspace)
-        let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
+    // Readers resolve with `agentSessionsFolderURL` or `agentSessionsFolderIfExists` and never create
+    // storage; only persistence writers call `ensureAgentSessionsFolder`.
 
+    /// Creates (if needed, with intermediates) and returns the "AgentSessions" subfolder. Writers only.
+    private func ensureAgentSessionsFolder(for workspace: some AgentWorkspaceStorageReference) throws -> URL {
+        let agentSessionsFolder = agentSessionsFolderURL(for: workspace)
         if !FileManager.default.fileExists(atPath: agentSessionsFolder.path) {
             try FileManager.default.createDirectory(at: agentSessionsFolder, withIntermediateDirectories: true)
         }
         return agentSessionsFolder
     }
 
-    /// Return the main folder for the workspace (with custom or default path).
-    private func workspaceFolderURL(for workspace: some AgentWorkspaceStorageReference) throws -> URL {
+    /// The "AgentSessions" subfolder when it exists as a directory; `nil` (and nothing created) otherwise.
+    private func agentSessionsFolderIfExists(for workspace: some AgentWorkspaceStorageReference) -> URL? {
+        let folder = agentSessionsFolderURL(for: workspace)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return nil
+        }
+        return folder
+    }
+
+    /// The "AgentSessions" subfolder location. Computes only; never touches the filesystem.
+    private func agentSessionsFolderURL(for workspace: some AgentWorkspaceStorageReference) -> URL {
+        workspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
+    }
+
+    /// The workspace's main folder (custom storage path or the default root). Computes only.
+    private func workspaceFolderURL(for workspace: some AgentWorkspaceStorageReference) -> URL {
         if let customURL = workspace.customStoragePath {
             return customURL
-        } else {
-            let root = MCPFilesystemConstants.identity.applicationSupportRootURL()
-                .appendingPathComponent("Workspaces", isDirectory: true)
-            if !FileManager.default.fileExists(atPath: root.path) {
-                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            }
-            let folderName = WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id)
-            let workspaceDir = root.appendingPathComponent(folderName)
-            if !FileManager.default.fileExists(atPath: workspaceDir.path) {
-                try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
-            }
-            return workspaceDir
         }
+        return workspacesRoot
+            .appendingPathComponent(WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id))
     }
 }

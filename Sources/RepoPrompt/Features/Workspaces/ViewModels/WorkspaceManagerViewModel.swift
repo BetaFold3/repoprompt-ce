@@ -60,14 +60,9 @@ private enum WorkspaceExitPerf {
 }
 
 enum WorkspaceStoragePaths {
-    static let defaultRoot: URL = {
-        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-        return home
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-            .appendingPathComponent("Workspaces", isDirectory: true)
-    }()
+    /// The default workspaces root, shared with `AgentSessionDataService` through
+    /// `WorkspaceStorageRoot` (a per-process temporary root under XCTest).
+    static let defaultRoot: URL = WorkspaceStorageRoot.defaultRootURL
 }
 
 struct WorkspaceFileLoadResult {
@@ -643,13 +638,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// A small sub-view-model (draft) for capturing "in-progress" workspace creation data
     @Published var creationDraft = WorkspaceCreationDraft()
 
+    /// Persisted through `WorkspaceGlobalCustomStorageLocation` (user defaults in the app; a
+    /// process-local value under XCTest).
     @Published var globalCustomStorageURL: URL? {
         didSet {
-            if let url = globalCustomStorageURL {
-                UserDefaults.standard.set(url.path, forKey: "GlobalCustomStorageURL")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
-            }
+            WorkspaceGlobalCustomStorageLocation.store(globalCustomStorageURL)
         }
     }
 
@@ -1653,8 +1646,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.promptViewModel.attachWorkspaceManager(self)
         self.fileManager.setWorkspaceManager(self)
 
-        if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
-            globalCustomStorageURL = URL(fileURLWithPath: path)
+        if let url = WorkspaceGlobalCustomStorageLocation.load() {
+            globalCustomStorageURL = url
         }
 
         // Track when the file selection changes to detect if active preset is dirty
@@ -1956,8 +1949,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// The workspace storage root startup recovery inventories: the configured global custom
     /// location, else the default root (the same resolution as `currentBaseRoot`).
     nonisolated static func recoveryInventoryBaseRoot() -> URL {
-        UserDefaults.standard.string(forKey: "GlobalCustomStorageURL").map { URL(fileURLWithPath: $0) }
-            ?? defaultWorkspaceRoot()
+        WorkspaceGlobalCustomStorageLocation.load() ?? defaultWorkspaceRoot()
     }
 
     /// Failure-reporting workspace inventory for startup recovery, beside the convenience loaders
@@ -7541,10 +7533,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .saveWorkspaceAsync,
         remainingRetryCount: Int = 1
     ) async -> Int? {
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled,
+              !suppressesWorkspaceDocumentPersistence(workspaceID, fileURL: fileURL)
+        else { return nil }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
         guard !Task.isCancelled,
-              let currentIndex = workspaceIndex(for: workspaceID)
+              let currentIndex = workspaceIndex(for: workspaceID),
+              !suppressesWorkspaceDocumentPersistence(workspaceID, fileURL: fileURL)
         else { return nil }
 
         let current = workspaces[currentIndex]
@@ -7606,7 +7601,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             #endif
             guard !Task.isCancelled,
-                  let latestIndex = workspaceIndex(for: workspaceID)
+                  let latestIndex = workspaceIndex(for: workspaceID),
+                  !suppressesWorkspaceDocumentPersistence(workspaceID, fileURL: fileURL)
             else { return nil }
             let latestStateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
             if latestStateVersion != capturedStateVersion {
@@ -7658,7 +7654,24 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    /// `isEphemeral` prevents automatic workspace-document persistence: an ephemeral workspace with
+    /// no `workspace.json` is never written (nor indexed; the index already excludes ephemeral
+    /// workspaces). It deletes nothing and does not change agent or chat session durability. A
+    /// workspace that already has a document and is later flagged ephemeral (the URL command's
+    /// `ephemeral`/`persist=false` on an existing workspace) keeps its existing save behavior.
+    /// The current in-memory flag is authoritative; a workspace no longer in the list falls back to
+    /// the flag of the value being saved. Callers recheck after every suspension before writing.
+    private func suppressesWorkspaceDocumentPersistence(
+        _ workspaceID: UUID,
+        fileURL: URL,
+        fallbackIsEphemeral: Bool = false
+    ) -> Bool {
+        let isEphemeral = workspaceIndex(for: workspaceID).map { workspaces[$0].isEphemeral } ?? fallbackIsEphemeral
+        return isEphemeral && !FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
     private func scheduleSave(workspaceID: UUID, fileURL: URL, source: WorkspaceSaveSource) {
+        guard !suppressesWorkspaceDocumentPersistence(workspaceID, fileURL: fileURL) else { return }
         Task {
             await saveWorkspaceAsync(
                 workspaceID: workspaceID,
@@ -7681,8 +7694,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
+        // An unpersisted ephemeral workspace is never written; callers still receive the would-be location.
+        guard !suppressesWorkspaceDocumentPersistence(
+            workspace.id,
+            fileURL: targetURL,
+            fallbackIsEphemeral: workspace.isEphemeral
+        ) else { return targetURL }
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         await WorkspaceDiskWriter.shared.flush(url: targetURL)
+        guard !suppressesWorkspaceDocumentPersistence(
+            workspace.id,
+            fileURL: targetURL,
+            fallbackIsEphemeral: workspace.isEphemeral
+        ) else { return targetURL }
 
         var workspaceToSave = workspace
         if preserveDiskRepoPathsIfUnchangedSinceBaseline,
@@ -7749,6 +7773,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
+        // An explicit synchronous write of the given value; not an automatic save, so the ephemeral
+        // guard on the automatic and mutation save paths does not apply here.
         // Encode JSON and prepare file path
         let encoded = try JSONEncoder().encode(workspace)
         let folder = try ensureWorkspaceDirectoryExists(for: workspace)
@@ -8556,10 +8582,26 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
-    /// Sets a workspace's ephemeral property by ID
-    func setWorkspaceEphemeral(_ workspaceID: UUID, _ value: Bool) {
-        if let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) {
-            workspaces[idx].isEphemeral = value
+    /// Sets a workspace's ephemeral flag by ID. Marking ephemeral only stops further automatic
+    /// persistence. Promotion (ephemeral to durable) clears the flag first and then persists the
+    /// workspace and the index normally.
+    func setWorkspaceEphemeral(_ workspaceID: UUID, _ value: Bool) async {
+        guard let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        let wasEphemeral = workspaces[idx].isEphemeral
+        workspaces[idx].isEphemeral = value
+        guard wasEphemeral, !value else { return }
+        bumpStateVersion(for: workspaceID)
+        do {
+            let finalURL = try await saveWorkspaceToFileAsync(
+                workspaces[idx],
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: false,
+                source: .promoteEphemeralWorkspace
+            )
+            await WorkspaceDiskWriter.shared.flush(url: finalURL)
+            await rebuildAndSaveIndexAsync()
+            await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+        } catch {
+            print("Error persisting promoted workspace: \(error)")
         }
     }
 
@@ -8638,14 +8680,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Creates an ephemeral workspace (non-persisted)
+    /// Creates an ephemeral workspace (non-persisted). Flagged at creation, so the creation path
+    /// never schedules its initial write.
     func createEphemeralWorkspace(name: String, repoPaths: [String]) -> WorkspaceModel {
-        var ws = createWorkspace(name: name, repoPaths: repoPaths)
-        if let idx = workspaces.firstIndex(where: { $0.id == ws.id }) {
-            workspaces[idx].isEphemeral = true
-            ws = workspaces[idx] // re-fetch the mutated copy
-        }
-        return ws
+        createWorkspace(name: name, repoPaths: repoPaths, ephemeral: true)
     }
 
     @MainActor

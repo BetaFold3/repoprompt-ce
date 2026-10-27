@@ -209,9 +209,12 @@ final class WorkspaceRootSyncTests: XCTestCase {
     }
 
     func testDefaultWorkspaceAndWindowRootsUseCESupportRoot() {
-        let workspaceRoot = WorkspaceStoragePaths.defaultRoot.path
-        XCTAssertTrue(workspaceRoot.contains("/Application Support/RepoPrompt CE/Workspaces"), workspaceRoot)
+        let workspaceRoot = WorkspaceStorageRoot.productionRootURL().path
+        XCTAssertTrue(workspaceRoot.hasSuffix("/Application Support/RepoPrompt CE/Workspaces"), workspaceRoot)
         XCTAssertFalse(workspaceRoot.contains("/Application Support/RepoPrompt/Workspaces"), workspaceRoot)
+        // The manager's default root is the shared resolver's, which XCTest keeps off the live store.
+        XCTAssertEqual(WorkspaceStoragePaths.defaultRoot, WorkspaceStorageRoot.defaultRootURL)
+        XCTAssertFalse(WorkspaceStoragePaths.defaultRoot.path.hasPrefix(workspaceRoot), WorkspaceStoragePaths.defaultRoot.path)
 
         let windowPath = WindowSessionStore.productionSessionFileURL().path
         XCTAssertTrue(windowPath.hasSuffix("/Application Support/RepoPrompt CE/windowSessions.json"), windowPath)

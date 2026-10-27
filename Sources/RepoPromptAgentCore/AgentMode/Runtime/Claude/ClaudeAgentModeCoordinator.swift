@@ -163,9 +163,23 @@ package final class ClaudeAgentModeCoordinator {
     }
 
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
+    /// Tabs whose unhealthy launch was retired for RepoPrompt MCP recovery: the successor must
+    /// resume this conversation and prove RepoPrompt MCP connected before any turn is submitted.
+    /// Kept until that evidence arrives, so every later preparation re-proves it. Each arming has
+    /// a fresh generation, so a confirmation that resumes after a suspension can tell whether the
+    /// recovery it was confirming is still the tab's current one.
+    private struct PendingRepoPromptMCPRecovery {
+        let conversationID: String
+        let generation: UUID
+    }
+
+    private var pendingRepoPromptMCPRecoveryByTabID: [UUID: PendingRepoPromptMCPRecovery] = [:]
+    static let repoPromptMCPRecoveryEvidenceTimeoutSeconds: TimeInterval = 20
     private var fallbackReplacementClaimByTabID: [UUID: FallbackReplacementClaim] = [:]
     private var privateFallbackControllerByTabID: [UUID: TrackedPrivateFallbackController] = [:]
     #if DEBUG
+        /// How many readiness calls joined an in-flight preparation instead of starting one.
+        private(set) var testPreparationJoinCount = 0
         private var testStopToolTrackingGate: (() async -> Void)?
         private var testBeforePromptCacheRetentionSync: ((AgentTabSession) -> Void)?
         private var testResumeRecoveryHandoffBeforeCommitGate: (@MainActor () async -> Void)?
@@ -285,6 +299,7 @@ package final class ClaudeAgentModeCoordinator {
         }
         controllerLaunchSettingsByTabID.removeAll()
         controllerRetirementGenerationByTabID.removeAll()
+        pendingRepoPromptMCPRecoveryByTabID.removeAll()
         fallbackReplacementClaimByTabID.removeAll()
         let privateFallbackControllers = privateFallbackControllerByTabID.values.map(\.controller)
         privateFallbackControllerByTabID.removeAll()
@@ -443,6 +458,9 @@ package final class ClaudeAgentModeCoordinator {
     ) async -> Bool {
         while true {
             if let existing = preparationByTabID[session.tabID] {
+                #if DEBUG
+                    testPreparationJoinCount += 1
+                #endif
                 await existing.task.value
                 let wasCancelled = existing.task.isCancelled
                 if preparationByTabID[session.tabID]?.id == existing.id {
@@ -542,9 +560,18 @@ package final class ClaudeAgentModeCoordinator {
         let toolSearchChanged = currentLaunchSettings?.toolSearchEnabled != effectiveToolSearchEnabled
         let autoPermissionValidationKeyChanged =
             currentLaunchSettings?.autoPermissionValidationKey != autoPermissionValidationKey
+        // A launch whose RepoPrompt MCP connection was lost is restarted here, at a turn boundary,
+        // resuming its conversation; it is never silently reused.
+        var repoPromptMCPRecoveryRequired = false
+        if let existingController = session.claudeController {
+            let health = await existingController.currentRepoPromptMCPHealth
+            guard !Task.isCancelled, sessionOwnsClaudeController(existingController, for: session) else { return }
+            repoPromptMCPRecoveryRequired = health.isUnhealthy
+        }
         if let existingController = session.claudeController,
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
            || sessionProfileChanged || toolSearchChanged || autoPermissionValidationKeyChanged
+           || repoPromptMCPRecoveryRequired
         {
             let hasTurnInFlight = await existingController.hasTurnInFlight
             guard !Task.isCancelled,
@@ -560,6 +587,14 @@ package final class ClaudeAgentModeCoordinator {
                     )
                 }
                 return
+            }
+            if repoPromptMCPRecoveryRequired, !runtimeVariantChanged {
+                guard await armRepoPromptMCPRecovery(for: session, controller: existingController),
+                      !Task.isCancelled
+                else {
+                    clearStaleRepoPromptMCPRecoveryStatus(for: session)
+                    return
+                }
             }
             await recycleClaudeControllerForLaunchSettingsChange(
                 session: session,
@@ -657,6 +692,7 @@ package final class ClaudeAgentModeCoordinator {
               session.runState.isActive,
               sessionOwnsClaudeController(controller, for: session)
         else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
             return
         }
         do {
@@ -690,6 +726,14 @@ package final class ClaudeAgentModeCoordinator {
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
             guard let installedController = session.claudeController else {
                 return
+            }
+            if pendingRepoPromptMCPRecoveryByTabID[session.tabID] != nil {
+                guard await confirmRepoPromptMCPRecovery(
+                    for: session,
+                    controller: installedController,
+                    runID: runID,
+                    runAttemptID: runAttemptID
+                ) else { return }
             }
             let controllerIdentifier = ObjectIdentifier(installedController as AnyObject)
             if let installedLaunchSettings = controllerLaunchSettingsByTabID[session.tabID],
@@ -823,6 +867,163 @@ package final class ClaudeAgentModeCoordinator {
                 for: session
             )
             finalizeSession(session, state: .failed, save: true)
+        }
+    }
+
+    // MARK: - RepoPrompt MCP health recovery
+
+    /// Arms recovery of a launch whose RepoPrompt MCP connection was lost, just before the caller
+    /// retires it: the successor resumes exactly this conversation (the implicit fresh fallback is
+    /// suppressed for it) and must prove RepoPrompt MCP connected before a turn is submitted.
+    /// Without a conversation to resume nothing restarts and the dispatch fails visibly.
+    private func armRepoPromptMCPRecovery(
+        for session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        stoppedRunningTurn: Bool = false
+    ) async -> Bool {
+        let sessionRef = await controller.currentSessionRef()
+        guard sessionOwnsClaudeController(controller, for: session) else { return false }
+        let conversationID = [sessionRef.sessionID, session.providerSessionID]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        guard let conversationID else {
+            failRepoPromptMCPRecovery(
+                for: session,
+                message: "RepoPrompt MCP disconnected from Claude and there is no conversation to resume, so nothing was sent. Start a new conversation to continue."
+            )
+            return false
+        }
+        updateProviderSessionIDIfNeeded(conversationID, for: session)
+        session.recoveryResumeFallbackSuppressedConversationID = conversationID
+        pendingRepoPromptMCPRecoveryByTabID[session.tabID] = PendingRepoPromptMCPRecovery(
+            conversationID: conversationID,
+            generation: UUID()
+        )
+        if stoppedRunningTurn, session.runState.isActive {
+            session.appendItem(.system(
+                Self.repoPromptMCPStoppedRunningTurnNotice,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+        }
+        setRepoPromptMCPRecoveryStatus(
+            stoppedRunningTurn
+                ? Self.repoPromptMCPStoppedTurnStatus
+                : Self.repoPromptMCPRestartingStatus,
+            for: session
+        )
+        Self.logger.notice(
+            "Claude RepoPrompt MCP recovery armed tab=\(session.tabID.uuidString, privacy: .public) stoppedRunningTurn=\(stoppedRunningTurn, privacy: .public)"
+        )
+        return true
+    }
+
+    static let repoPromptMCPRestartingStatus = "Restarting Claude to reconnect RepoPrompt MCP…"
+    static let repoPromptMCPStoppedTurnStatus = "Stopped the running turn to reconnect RepoPrompt tools…"
+    static let repoPromptMCPWaitingStatus = "Waiting for RepoPrompt MCP to reconnect…"
+    static let repoPromptMCPStoppedRunningTurnNotice = "RepoPrompt tools disconnected during the running turn, so it was stopped to reconnect them. Claude is restarting and resuming this conversation; your new message is sent once RepoPrompt MCP reconnects."
+
+    /// Recovery status is shown only while a dispatch is active: an idle tab never shows it.
+    private func setRepoPromptMCPRecoveryStatus(_ text: String, for session: AgentTabSession) {
+        guard session.runState.isActive else { return }
+        session.setRunningStatus(text, source: .transport)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    /// Clears a recovery status left behind once no dispatch is active any more. Another
+    /// attempt's status (or any non-recovery status) is never touched.
+    private func clearStaleRepoPromptMCPRecoveryStatus(for session: AgentTabSession) {
+        guard !session.runState.isActive,
+              session.runningStatusSource == .transport,
+              let text = session.runningStatusText,
+              [
+                  Self.repoPromptMCPRestartingStatus,
+                  Self.repoPromptMCPStoppedTurnStatus,
+                  Self.repoPromptMCPWaitingStatus
+              ].contains(text)
+        else { return }
+        session.setRunningStatus(nil, source: nil)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    /// Waits for the recovered launch's fresh RepoPrompt MCP connected evidence. On failure the
+    /// launch is retired (recovery stays pending for the next attempt), the failure is shown, and
+    /// nothing is submitted. A wait or retirement that was superseded (another run or attempt,
+    /// another recovery generation) or cancelled changes nothing.
+    private func confirmRepoPromptMCPRecovery(
+        for session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        runID: UUID,
+        runAttemptID: UUID?
+    ) async -> Bool {
+        guard let generation = pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.generation else {
+            return true
+        }
+        func stillCurrent() -> Bool {
+            !Task.isCancelled
+                && session.runID == runID
+                && session.activeRunAttemptID == runAttemptID
+                && session.runState.isActive
+                && pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.generation == generation
+        }
+        setRepoPromptMCPRecoveryStatus(Self.repoPromptMCPWaitingStatus, for: session)
+        let outcome = await controller.awaitRepoPromptMCPConnectedEvidence(
+            timeoutSeconds: Self.repoPromptMCPRecoveryEvidenceTimeoutSeconds,
+            pollIntervalSeconds: 0.25
+        )
+        guard stillCurrent(), sessionOwnsClaudeController(controller, for: session) else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
+            return false
+        }
+        switch outcome {
+        case .connected:
+            pendingRepoPromptMCPRecoveryByTabID.removeValue(forKey: session.tabID)
+            session.setRunningStatus("Thinking…", source: .transport)
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            Self.logger.notice(
+                "Claude RepoPrompt MCP recovery confirmed tab=\(session.tabID.uuidString, privacy: .public)"
+            )
+            return true
+        case let .notConnected(reason):
+            if let detached = detachClaudeController(controller, from: session, removeToolTracking: true) {
+                _ = await retireClaudeController(detached, for: session, captureProviderSessionID: true)
+            }
+            // Retirement suspends: a superseding run, attempt or recovery owns the session now.
+            guard stillCurrent() else {
+                Self.logger.notice(
+                    "Claude RepoPrompt MCP recovery failure superseded during retirement tab=\(session.tabID.uuidString, privacy: .public)"
+                )
+                clearStaleRepoPromptMCPRecoveryStatus(for: session)
+                return false
+            }
+            failRepoPromptMCPRecovery(
+                for: session,
+                message: "RepoPrompt MCP did not reconnect after Claude restarted (\(reason)). Nothing was sent; send your message again to retry."
+            )
+            return false
+        }
+    }
+
+    /// Fails the active user dispatch visibly. Without one (no dispatch is active), nothing is
+    /// finalized and no recovery status is left on the idle tab: the pending recovery stays, and
+    /// the next dispatch retries it.
+    private func failRepoPromptMCPRecovery(for session: AgentTabSession, message: String) {
+        Self.logger.error(
+            "Claude RepoPrompt MCP recovery failed tab=\(session.tabID.uuidString, privacy: .public) active=\(session.runState.isActive, privacy: .public): \(message, privacy: .public)"
+        )
+        guard session.runState.isActive else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
+            return
+        }
+        session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        finalizeSession(session, state: .failed, save: true)
+    }
+
+    /// Drops a pending recovery when the tab's conversation ends (reset or provider identity
+    /// change): it applied only to that conversation.
+    private func clearRepoPromptMCPRecovery(for session: AgentTabSession) {
+        guard let pending = pendingRepoPromptMCPRecoveryByTabID.removeValue(forKey: session.tabID) else { return }
+        if session.recoveryResumeFallbackSuppressedConversationID == pending.conversationID {
+            session.recoveryResumeFallbackSuppressedConversationID = nil
         }
     }
 
@@ -1139,6 +1340,12 @@ package final class ClaudeAgentModeCoordinator {
             fallbackReplacementClaimByTabID[session.tabID] != nil
         }
 
+        func test_pendingRepoPromptMCPRecoveryConversationID(
+            for session: AgentTabSession
+        ) -> String? {
+            pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.conversationID
+        }
+
         func test_hasTrackedPrivateFallbackController(
             for session: AgentTabSession
         ) -> Bool {
@@ -1230,6 +1437,16 @@ package final class ClaudeAgentModeCoordinator {
         // fallback carry the scope of the run attempt captured here, never one read later.
         let runtimeOwner = session.runtimeSessionScope(processRunID: runID)
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
+        if let pendingConversationID = pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.conversationID {
+            if pendingConversationID == existingSessionID {
+                // Every start of a pending RepoPrompt MCP recovery resumes exactly that
+                // conversation; an unavailable resume asks the user rather than starting fresh.
+                session.recoveryResumeFallbackSuppressedConversationID = pendingConversationID
+            } else {
+                // The tab moved to another (or no) conversation: that recovery no longer applies.
+                clearRepoPromptMCPRecovery(for: session)
+            }
+        }
         if controller.joinsRetirementBeforeSuccessor {
             // R6: a retired registered runtime of this tab (any provider, for example a Codex
             // controller retired by a provider switch) finishes its cleanup before this start
@@ -1549,7 +1766,8 @@ package final class ClaudeAgentModeCoordinator {
              .invalidControlResponse,
              .controlRequestTimedOut:
             return true
-        case .liveModelSwitchRequiresRestart:
+        case .liveModelSwitchRequiresRestart,
+             .repoPromptMCPRecoveryRequired:
             return false
         }
     }
@@ -1755,7 +1973,7 @@ package final class ClaudeAgentModeCoordinator {
     private static func sendErrorProvesNoWrite(_ error: Error) -> Bool {
         guard let controllerError = error as? NativeAgentRuntimeControllerError else { return false }
         switch controllerError {
-        case .processNotRunning, .initializationFailed:
+        case .processNotRunning, .initializationFailed, .repoPromptMCPRecoveryRequired:
             return true
         default:
             return false
@@ -1821,6 +2039,8 @@ package final class ClaudeAgentModeCoordinator {
             return false
         }
 
+        // One automatic RepoPrompt MCP recovery restart per dispatch, never a loop.
+        var repoPromptMCPRecoveryAttempted = false
         for _ in 0 ..< 3 {
             let preparationReady = await ensureClaudeNativeSessionReadiness(session: session)
             guard preparationReady,
@@ -1890,6 +2110,80 @@ package final class ClaudeAgentModeCoordinator {
             guard hasActiveSession else {
                 finalizeSession(session, state: .failed)
                 return false
+            }
+
+            // Preparation restarts an unhealthy idle launch; one still unhealthy here had a turn in
+            // flight (or lost its connection again). This dispatch ends that turn, exactly as a
+            // launch-settings recycle does, and restarts once, resuming the conversation.
+            let repoPromptMCPHealth = await controller.currentRepoPromptMCPHealth
+            guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                return false
+            }
+            guard sessionOwnsClaudeController(controller, for: session) else {
+                continue
+            }
+            if repoPromptMCPHealth.isUnhealthy {
+                guard !repoPromptMCPRecoveryAttempted else {
+                    failRepoPromptMCPRecovery(
+                        for: session,
+                        message: "RepoPrompt MCP disconnected from Claude again right after a restart. Nothing was sent; send your message again to retry."
+                    )
+                    return false
+                }
+                let stoppingRunningTurn = await controller.hasTurnInFlight
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+                let interrupted = await interruptClaudeTurnIfNeeded(
+                    session: session,
+                    controller: controller,
+                    handler: handler,
+                    dispatchReservation: dispatchReservation
+                )
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard interrupted else {
+                    if !sessionOwnsClaudeController(controller, for: session) {
+                        continue
+                    }
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+                // Consumed only once this dispatch owns the ended turn: a controller replaced
+                // while interrupting is re-examined as a fresh launch, not as a failed restart.
+                repoPromptMCPRecoveryAttempted = true
+                guard await armRepoPromptMCPRecovery(
+                    for: session,
+                    controller: controller,
+                    stoppedRunningTurn: stoppingRunningTurn
+                ) else {
+                    return false
+                }
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                await recycleClaudeControllerForLaunchSettingsChange(
+                    session: session,
+                    existingController: controller,
+                    runtimeVariantChanged: false
+                )
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                if let runID = session.runID {
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: runID)
+                    guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                        return false
+                    }
+                    handler = toolHandler(for: session)
+                }
+                continue
             }
 
             let interrupted = await interruptClaudeTurnIfNeeded(
@@ -2321,6 +2615,7 @@ package final class ClaudeAgentModeCoordinator {
     ) -> DetachedClaudeController? {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
+        clearRepoPromptMCPRecovery(for: session)
         session.providerSessionID = nil
         return detached
     }
@@ -2363,6 +2658,7 @@ package final class ClaudeAgentModeCoordinator {
     package func prepareForConversationResetSync(_ session: AgentTabSession) {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
+        clearRepoPromptMCPRecovery(for: session)
         Task { await cancelClaudeRun(session, oldController: detached) }
     }
 

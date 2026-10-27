@@ -56,7 +56,105 @@ package protocol AgentMCPHosting: Sendable {
 
     func unregisterToolObservers(for runID: UUID) async
 
+    /// Registers one provider launch's observer for loss of its run's RepoPrompt MCP tool path: the
+    /// tool-execution watchdog force-disconnect, a helper process that exited after its connection
+    /// closed, or a helper that stayed alive without restoring the run route. Watchdog events are
+    /// captured when the connection's terminal state is committed, before any suspension; helper
+    /// events are resolved later by the manager's helper-exit watch. Delivery is fire-and-forget
+    /// and never delays or blocks containment. Each event is addressed to `launch` and states what
+    /// the app could prove about that launch's ownership.
+    func registerRunConnectionLossObserver(
+        for runID: UUID,
+        launch: AgentMCPRunLaunchIdentity,
+        observer: @escaping @Sendable (AgentMCPRunConnectionLoss) async -> Void
+    ) async -> UUID
+
+    func unregisterRunConnectionLossObserver(for runID: UUID, token: UUID) async
+
     #if DEBUG
         func debugRecordRunRoutingEvent(runID: UUID, event: String, connectionID: UUID?, fields: [String: String]) async
     #endif
+}
+
+/// One provider launch (process) of a run, as registered for connection-loss delivery. Immutable:
+/// a successor launch registers a new identity.
+package struct AgentMCPRunLaunchIdentity: Equatable {
+    /// Unique per spawned process; never reused by a successor launch.
+    package let token: UUID
+    /// The PID this launch registered as the run's expected agent process.
+    package let agentProcessID: pid_t
+
+    package init(token: UUID, agentProcessID: pid_t) {
+        self.token = token
+        self.agentProcessID = agentProcessID
+    }
+}
+
+/// A loss of one run-routed RepoPrompt MCP connection's tool path, addressed to one registered
+/// launch. Immutable and captured from the connection's run route before the connection is
+/// removed, so the launch can tell its own connection from a stale one.
+package struct AgentMCPRunConnectionLoss: Equatable {
+    package enum Reason: String, Equatable {
+        /// A tool exceeded its execution deadline and ignored cancellation grace; the app severed
+        /// the connection, and the helper exits by design.
+        case toolExecutionWatchdog = "tool_execution_watchdog"
+        /// The connection closed and its `repoprompt-mcp` helper process then exited (gone,
+        /// zombie, or its PID reused), so the agent's stdio MCP server is dead.
+        case helperExited = "helper_exited"
+        /// The connection closed and its helper stayed alive but never restored a run route for
+        /// this run within the reconnect deadline.
+        case routeNotRestored = "route_not_restored"
+    }
+
+    package let runID: UUID
+    package let connectionID: UUID
+    package let clientName: String?
+    /// The token of the registered launch this event is addressed to.
+    package let launchToken: UUID
+    /// The addressed launch's agent PID when the app proved it is an ancestor of the helper peer
+    /// (from the ancestry snapshot captured at admission, or a live query when no snapshot
+    /// exists); `nil` when unproven. Helper-exit reasons are only ever emitted with a proven PID.
+    package let agentProcessID: pid_t?
+    /// The connection already existed when the addressed launch registered, so it cannot be that
+    /// launch's own helper connection unless its agent PID is proven.
+    package let connectionPredatesLaunch: Bool
+    /// The tool whose execution triggered a watchdog loss; `nil` for helper-exit reasons.
+    package let toolName: String?
+    package let reason: Reason
+    /// The app-side close reason of the triggering connection (for example `peer_eof` or
+    /// `idle_timeout`); `tool_execution_watchdog` for watchdog losses.
+    package let closeReason: String
+
+    package init(
+        runID: UUID,
+        connectionID: UUID,
+        clientName: String?,
+        launchToken: UUID,
+        agentProcessID: pid_t?,
+        connectionPredatesLaunch: Bool,
+        toolName: String?,
+        reason: Reason,
+        closeReason: String
+    ) {
+        self.runID = runID
+        self.connectionID = connectionID
+        self.clientName = clientName
+        self.launchToken = launchToken
+        self.agentProcessID = agentProcessID
+        self.connectionPredatesLaunch = connectionPredatesLaunch
+        self.toolName = toolName
+        self.reason = reason
+        self.closeReason = closeReason
+    }
+
+    /// Whether the event provably concerns the launch it is addressed to: a proven agent PID that
+    /// is the launch's registered one, or (unproven) a connection admitted after the launch
+    /// registered. A launch token alone is never proof of the connection's ownership.
+    package func provesOwnership(by launch: AgentMCPRunLaunchIdentity) -> Bool {
+        guard launchToken == launch.token else { return false }
+        if let agentProcessID {
+            return agentProcessID == launch.agentProcessID
+        }
+        return !connectionPredatesLaunch
+    }
 }

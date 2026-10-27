@@ -2739,6 +2739,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     /// Exact user frames this fake wrote, encoded by the production codec with the UUID its own
     /// admission returned (managed-transport mode only).
     private var writtenUserFrames: [Data] = []
+    private var repoPromptMCPHealthValue: NativeAgentRuntimeRepoPromptMCPHealth = .unknown
+    private var repoPromptMCPProbeOutcome: NativeAgentRuntimeRepoPromptMCPProbeOutcome = .connected
+    private var repoPromptMCPProbeGate: LifecycleAsyncGate?
+    private var repoPromptMCPHealthGate: LifecycleAsyncGate?
+    private var repoPromptMCPHealthReadCount = 0
+    private var repoPromptMCPProbeCount = 0
 
     init(
         recorder: LifecycleRecorder,
@@ -2912,6 +2918,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         )))
     }
 
+    /// Forwards an event verbatim (for example one a real controller emitted) into this
+    /// controller's stream.
+    func emitRuntimeEvent(_ event: NativeAgentRuntimeEvent) {
+        streamContinuation.yield(event)
+    }
+
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
         if let currentSessionRefGate {
             recorder.record("\(label):current-ref")
@@ -3040,6 +3052,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
     }
 
+    func currentPendingTurnCompletionID() -> UUID? {
+        pendingTurnCompletionID
+    }
+
     func emitPendingTurnCompletion() {
         guard let turnID = pendingTurnCompletionID else { return }
         pendingTurnCompletionID = nil
@@ -3091,4 +3107,54 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {}
+
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
+        get async {
+            repoPromptMCPHealthReadCount += 1
+            if let repoPromptMCPHealthGate {
+                await repoPromptMCPHealthGate.arriveAndWait()
+            }
+            return repoPromptMCPHealthValue
+        }
+    }
+
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome {
+        recorder.record("\(label):mcp-probe")
+        repoPromptMCPProbeCount += 1
+        if let repoPromptMCPProbeGate {
+            await repoPromptMCPProbeGate.arriveAndWait()
+        }
+        if case .connected = repoPromptMCPProbeOutcome {
+            repoPromptMCPHealthValue = .connected
+        }
+        return repoPromptMCPProbeOutcome
+    }
+
+    func setRepoPromptMCPHealth(_ health: NativeAgentRuntimeRepoPromptMCPHealth) {
+        repoPromptMCPHealthValue = health
+    }
+
+    func setRepoPromptMCPProbe(
+        outcome: NativeAgentRuntimeRepoPromptMCPProbeOutcome,
+        gate: LifecycleAsyncGate? = nil
+    ) {
+        repoPromptMCPProbeOutcome = outcome
+        repoPromptMCPProbeGate = gate
+    }
+
+    func recordedRepoPromptMCPProbeCount() -> Int {
+        repoPromptMCPProbeCount
+    }
+
+    /// Holds every health read until the gate is released.
+    func setRepoPromptMCPHealthGate(_ gate: LifecycleAsyncGate?) {
+        repoPromptMCPHealthGate = gate
+    }
+
+    func recordedRepoPromptMCPHealthReadCount() -> Int {
+        repoPromptMCPHealthReadCount
+    }
 }

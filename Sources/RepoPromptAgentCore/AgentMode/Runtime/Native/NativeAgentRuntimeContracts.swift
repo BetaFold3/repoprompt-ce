@@ -48,6 +48,15 @@ package protocol NativeAgentRuntimeControlling: Actor {
     /// R6: whether this runtime's launches are registered. A registered start joins the tab's
     /// retained runtime retirements (any provider) before it reserves. Others never join.
     nonisolated var joinsRetirementBeforeSuccessor: Bool { get }
+    /// RepoPrompt MCP health of the current launch. Runtimes without health tracking report
+    /// `.unknown` and are never recovered for MCP health.
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth { get async }
+    /// Bounded wait for fresh RepoPrompt MCP connected evidence on the current launch. Runtimes
+    /// without such evidence never report `connected`.
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome
 }
 
 extension NativeAgentRuntimeControlling {
@@ -75,6 +84,17 @@ extension NativeAgentRuntimeControlling {
     nonisolated var joinsRetirementBeforeSuccessor: Bool {
         false
     }
+
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
+        get async { .unknown }
+    }
+
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds _: TimeInterval,
+        pollIntervalSeconds _: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome {
+        .notConnected("This runtime reports no RepoPrompt MCP connection evidence.")
+    }
 }
 
 package struct NativeAgentRuntimeEventsSubscription {
@@ -97,6 +117,8 @@ typealias NativeAgentRuntimeTurnStatus = ClaudeNativeProcessSessionController.Tu
 typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionController.RuntimeInitStatus
 package typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
 typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
+package typealias NativeAgentRuntimeRepoPromptMCPHealth = ClaudeNativeProcessSessionController.RepoPromptMCPHealth
+package typealias NativeAgentRuntimeRepoPromptMCPProbeOutcome = ClaudeNativeProcessSessionController.RepoPromptMCPConnectionProbeOutcome
 package typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
 package typealias NativeUsageAccountingEvent = ClaudeNativeProcessSessionController.UsageAccountingEvent
 typealias NativeProcessLaunchIdentity = ClaudeNativeProcessSessionController.ProcessLaunchIdentity

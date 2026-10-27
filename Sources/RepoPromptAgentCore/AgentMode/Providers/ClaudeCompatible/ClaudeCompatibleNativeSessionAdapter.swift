@@ -95,6 +95,20 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         await controller.respondToPermissionRequest(id: id, decision: decision)
     }
 
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
+        get async { await controller.currentRepoPromptMCPHealth }
+    }
+
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome {
+        await controller.awaitRepoPromptMCPConnectedEvidence(
+            timeoutSeconds: timeoutSeconds,
+            pollIntervalSeconds: pollIntervalSeconds
+        )
+    }
+
     static func streamResult(from providerResult: ClaudeCompatiblePluginStreamResult) -> AIStreamResult {
         ClaudeCompatiblePluginBridge.streamResult(from: providerResult)
     }

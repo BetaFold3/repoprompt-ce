@@ -47,7 +47,7 @@ Sources/
     Diagnostics/                 # workspace restore/root-load/worktree-startup instrumentation and MCP tool work counts
     Diffing/                     # diff parsing/application/generation substrate and edit-flow performance tracing
     FileSystem/                  # filesystem services, ignore rules (incl. GitignoreCompiler), watcher ingress, and workspace inventory
-    Persistence/                 # code-map and durable artifact stores, MCP filesystem constants
+    Persistence/                 # code-map and durable artifact stores, MCP filesystem constants, Workspaces store root resolver (WorkspaceStorageRoot)
     Search/                      # search matches/options, path filtering, and store-backed workspace search
     SyntaxParsing/               # syntax manager
     Utilities/                   # standardized paths and checkout path identity

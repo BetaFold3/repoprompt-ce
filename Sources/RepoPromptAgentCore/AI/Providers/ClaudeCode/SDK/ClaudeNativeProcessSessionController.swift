@@ -35,6 +35,26 @@ package final actor ClaudeNativeProcessSessionController {
         case failed
     }
 
+    /// RepoPrompt MCP health of the current launch. Transient and launch-scoped: every spawn starts
+    /// `unknown`; fresh evidence (a `system/init` or `mcp_status` report of `connected`) makes it
+    /// `connected`; an app-initiated loss of this launch's connection makes it `unhealthy` for the
+    /// rest of the launch, and no later evidence on that launch restores `connected`.
+    package enum RepoPromptMCPHealth: Equatable {
+        case unknown
+        case connected
+        case unhealthy(reason: String)
+
+        var isUnhealthy: Bool {
+            if case .unhealthy = self { true } else { false }
+        }
+    }
+
+    /// Outcome of waiting for fresh RepoPrompt MCP connected evidence on the current launch.
+    package enum RepoPromptMCPConnectionProbeOutcome: Equatable {
+        case connected
+        case notConnected(String)
+    }
+
     package struct RuntimeInitStatus: Equatable {
         struct InitializeResponseSnapshot: Equatable {
             struct Command: Equatable {
@@ -70,8 +90,11 @@ package final actor ClaudeNativeProcessSessionController {
 
         let sessionID: String?
         let tools: [String]
+        /// Reported statuses with the launch's authoritative RepoPrompt health overlaid: an
+        /// unhealthy launch reports RepoPrompt as `disconnected` whatever the runtime last said.
         let mcpServerStatuses: [String: String]
         let initializeResponse: InitializeResponseSnapshot?
+        var repoPromptMCPHealth: RepoPromptMCPHealth = .unknown
 
         var repoPromptServerStatus: String? {
             mcpServerStatuses.first {
@@ -386,6 +409,9 @@ package final actor ClaudeNativeProcessSessionController {
         case inputWriteFailed(String)
         case controlRequestTimedOut(requestID: String, detail: String?)
         case liveModelSwitchRequiresRestart
+        /// The launch's RepoPrompt MCP connection was lost; it must be restarted (resuming its
+        /// conversation) before it can take another turn. Thrown before any write.
+        case repoPromptMCPRecoveryRequired(String)
 
         var errorDescription: String? {
             switch self {
@@ -405,6 +431,8 @@ package final actor ClaudeNativeProcessSessionController {
                 }
             case .liveModelSwitchRequiresRestart:
                 "Changing to the selected model requires restarting Claude because its launch environment changes."
+            case let .repoPromptMCPRecoveryRequired(reason):
+                "RepoPrompt MCP is disconnected from this Claude process (\(reason)); Claude must restart and resume this conversation before the next turn."
             }
         }
     }
@@ -555,6 +583,28 @@ package final actor ClaudeNativeProcessSessionController {
     /// The last emitted runtime init status, used to deduplicate emissions.
     private var lastEmittedRuntimeInitStatus: RuntimeInitStatus?
 
+    // MARK: - RepoPrompt MCP health (launch-scoped)
+
+    private var repoPromptMCPHealth: RepoPromptMCPHealth = .unknown
+    /// `async` to match `NativeAgentRuntimeControlling` exactly, so the protocol default never
+    /// becomes the witness.
+    package var currentRepoPromptMCPHealth: RepoPromptMCPHealth {
+        get async { repoPromptMCPHealth }
+    }
+
+    /// Connection IDs whose loss this launch already applied (duplicate deliveries are ignored).
+    private var repoPromptMCPLostConnectionIDs: Set<UUID> = []
+    private var runConnectionLossObserverToken: UUID?
+    /// The launch identity the current loss observer is registered for.
+    private var runConnectionLossObserverLaunch: AgentMCPRunLaunchIdentity?
+    /// Unique per spawned process; set at spawn, cleared at shutdown. A loss is applied only when
+    /// it is addressed to this token and proves ownership by the registered launch identity.
+    private var repoPromptMCPLaunchToken: UUID?
+    #if DEBUG
+        /// Every loss decision (connection ID, `applied` or the ignore reason), in delivery order.
+        private var debugRepoPromptMCPLossDecisions: [(connectionID: UUID, decision: String)] = []
+    #endif
+
     #if DEBUG
         private var decodeSkippedWarningCount = 0
         /// Test-only suspension at R6 fence checkpoints (`launchCaptured` before the first await,
@@ -579,6 +629,9 @@ package final actor ClaudeNativeProcessSessionController {
     /// bytes/EOF is keyed on this token, never on accounting state (`usageLaunchState`), so
     /// transcript and control delivery cannot depend on the usage feature (OracleB P1#4).
     private var activeStdoutLaunchToken: UUID?
+    /// The launch whose stdout reached EOF. Its RepoPrompt MCP loss events are ignored: the
+    /// launch is already ending, and `process` stays set through the EOF handler's awaited tail.
+    private var repoPromptMCPStdoutRetiredLaunchToken: UUID?
     /// Step 4d3b (inactive): injected live-identity qualification; `false` by default and set by no
     /// production caller.
     private let liveTranscriptQualificationEnabled: Bool
@@ -715,8 +768,12 @@ package final actor ClaudeNativeProcessSessionController {
         let pid = registeredExpectedAgentPID
         let runID = runID
         let mcpHost = mcpHost
+        let lossObserverToken = runConnectionLossObserverToken
         Task {
             await mcpHost.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            if let lossObserverToken {
+                await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: lossObserverToken)
+            }
         }
     }
 
@@ -824,6 +881,12 @@ package final actor ClaudeNativeProcessSessionController {
     ) async throws -> SessionRef {
         let initializationGenerationAtEntry = initializationGeneration
         if process != nil, isInitialized {
+            // An unhealthy launch is never silently reused: the owner restarts it (resuming the
+            // conversation) at a turn boundary.
+            if case let .unhealthy(reason) = repoPromptMCPHealth {
+                writeRawEventLogRecord(kind: "session.startOrResume.mcpRecoveryRequired", payload: ["reason": reason])
+                throw ControllerError.repoPromptMCPRecoveryRequired(reason)
+            }
             return SessionRef(
                 sessionID: sessionID,
                 configuredContextWindow: configuredContextWindow,
@@ -963,6 +1026,9 @@ package final actor ClaudeNativeProcessSessionController {
     package func sendUserMessage(_ text: String) async throws -> UUID {
         guard process != nil else {
             throw ControllerError.processNotRunning
+        }
+        if case let .unhealthy(reason) = repoPromptMCPHealth {
+            throw ControllerError.repoPromptMCPRecoveryRequired(reason)
         }
         guard isInitialized else {
             throw ControllerError.initializationFailed(
@@ -1131,6 +1197,9 @@ package final actor ClaudeNativeProcessSessionController {
         // Includes an EOF-path reap of an earlier root of this controller.
         await joinPendingRootReaps()
         await clearExpectedAgentPIDIfNeeded()
+        await unregisterRunConnectionLossObserverIfNeeded()
+        resetRepoPromptMCPHealthForLaunch()
+        repoPromptMCPLaunchToken = nil
         process = nil
         configuredContextWindow = nil
         promptCacheRetention = .standard
@@ -1371,6 +1440,8 @@ package final actor ClaudeNativeProcessSessionController {
         latestRuntimeInitTools = []
         latestRuntimeInitMcpServerStatuses = [:]
         lastEmittedRuntimeInitStatus = nil
+        resetRepoPromptMCPHealthForLaunch()
+        installSpawnLaunchTokens(launchToken)
         process = spawned
         runtimeLaunch = launch
         runtimeManagedTransport = launch != nil
@@ -1378,7 +1449,6 @@ package final actor ClaudeNativeProcessSessionController {
         // The reservation associated the requested conversation (resume or fresh preallocation).
         runtimeAssociatedConversationID = launch == nil ? nil : (resumeSessionID ?? freshSessionID)
         runtimeLastOwnerScope = launch?.context.session
-        activeStdoutLaunchToken = launchToken
         installLiveTranscriptQualification(launchToken: launchToken)
         do {
             try startStdoutReader(handle: spawned.stdout, launchToken: launchToken)
@@ -2441,6 +2511,9 @@ package final actor ClaudeNativeProcessSessionController {
         if let (tools, mcpStatuses) = Self.parseSystemInitFields(from: payload) {
             latestRuntimeInitTools = tools
             latestRuntimeInitMcpServerStatuses = mcpStatuses
+            if Self.repoPromptStatus(in: mcpStatuses)?.lowercased() == "connected" {
+                noteRepoPromptMCPConnectedEvidence(source: "system_init")
+            }
             writeRawEventLogRecord(kind: "runtime.init.stream", payload: [
                 "sessionID": sessionID ?? "",
                 "tools": tools,
@@ -2740,6 +2813,305 @@ package final actor ClaudeNativeProcessSessionController {
         return (tools: tools, mcpStatuses: mcpStatuses)
     }
 
+    // MARK: - RepoPrompt MCP health helpers
+
+    static let repoPromptMCPDisconnectedStatus = "disconnected"
+
+    /// The reported statuses as published: an unhealthy launch reports RepoPrompt `disconnected`
+    /// (never `connected`, and never `failed`, which ends the run as a startup failure).
+    static func overlayingRepoPromptMCPHealth(
+        _ health: RepoPromptMCPHealth,
+        on statuses: [String: String]
+    ) -> [String: String] {
+        guard health.isUnhealthy else { return statuses }
+        var overlaid = statuses
+        let key = statuses.keys.first {
+            $0.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+        } ?? MCPIntegrationHelper.repoPromptMCPServerName
+        overlaid[key] = repoPromptMCPDisconnectedStatus
+        return overlaid
+    }
+
+    static func repoPromptStatus(in statuses: [String: String]) -> String? {
+        statuses.first {
+            $0.key.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+        }?.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The RepoPrompt entry of an `mcp_status` control response (`{"mcpServers": [{name, status}]}`).
+    static func repoPromptStatus(inMCPStatusResponse response: [String: Any]) -> String? {
+        guard let servers = response["mcpServers"] as? [[String: Any]] else { return nil }
+        var statuses: [String: String] = [:]
+        for server in servers {
+            guard let name = server["name"] as? String else { continue }
+            statuses[name] = (server["status"] as? String) ?? ""
+        }
+        return repoPromptStatus(in: statuses)
+    }
+
+    static func repoPromptMCPDisconnectedMessage(toolName: String) -> String {
+        "RepoPrompt MCP disconnected from Claude: tool '\(toolName)' did not stop after its deadline, so RepoPrompt closed the connection. RepoPrompt tools are unavailable for the rest of this turn; Claude restarts and resumes this conversation before your next message."
+    }
+
+    /// The non-terminal transcript error for a loss, worded by its reason in plain words. The raw
+    /// close code stays in the `mcp.health.unhealthy` log payload only.
+    static func repoPromptMCPDisconnectedMessage(for loss: AgentMCPRunConnectionLoss) -> String {
+        let consequence = "RepoPrompt tools are unavailable for the rest of this turn; before your next message is sent, Claude restarts and resumes this conversation to reconnect them."
+        switch loss.reason {
+        case .toolExecutionWatchdog:
+            return repoPromptMCPDisconnectedMessage(toolName: loss.toolName ?? "unknown")
+        case .helperExited:
+            let cause = repoPromptMCPAppSideCloseDescription(loss.closeReason)
+                .map { "\($0), and the RepoPrompt MCP helper process exited" }
+                ?? "the RepoPrompt MCP helper process exited"
+            return "RepoPrompt MCP disconnected from Claude: \(cause). \(consequence)"
+        case .routeNotRestored:
+            let cause = repoPromptMCPAppSideCloseDescription(loss.closeReason)
+                ?? "the RepoPrompt MCP helper lost its connection to RepoPrompt"
+            return "RepoPrompt MCP disconnected from Claude: \(cause), and the helper has not reconnected. \(consequence)"
+        }
+    }
+
+    /// Plain words for a close RepoPrompt itself initiated or detected as a transport failure;
+    /// `nil` when the helper side closed (or the code is unknown), which the caller words as a
+    /// helper-side close.
+    static func repoPromptMCPAppSideCloseDescription(_ closeReason: String) -> String? {
+        switch closeReason {
+        case "idle_timeout":
+            "RepoPrompt closed the idle connection"
+        case "user_boot_from_dashboard":
+            "RepoPrompt disconnected it from the dashboard"
+        case "approval_denied":
+            "RepoPrompt denied the connection"
+        case "local_disconnect":
+            "RepoPrompt closed the connection"
+        case "read_error", "write_failure", "write_stall", "write_hangup", "receive_buffer_overflow":
+            "the connection to RepoPrompt failed"
+        default:
+            nil
+        }
+    }
+
+    private func resetRepoPromptMCPHealthForLaunch() {
+        repoPromptMCPHealth = .unknown
+        repoPromptMCPLostConnectionIDs.removeAll()
+    }
+
+    /// The single place a spawn installs its launch token: the stdout reader generation and the
+    /// RepoPrompt MCP loss gate always share it, so `handleStdoutEOF`'s retirement (keyed on the
+    /// stdout token) is compared with the same value in `noteRepoPromptMCPConnectionLost`.
+    private func installSpawnLaunchTokens(_ launchToken: UUID) {
+        repoPromptMCPLaunchToken = launchToken
+        activeStdoutLaunchToken = launchToken
+    }
+
+    /// Retires the current stdout reader generation. `handleStdoutEOF` does this before its
+    /// awaited tail, while `process` is still set, so the launch is marked retired for loss
+    /// handling at the same synchronous point.
+    private func retireActiveStdoutLaunch(_ launchToken: UUID) {
+        activeStdoutLaunchToken = nil
+        repoPromptMCPStdoutRetiredLaunchToken = launchToken
+    }
+
+    private func noteRepoPromptMCPConnectedEvidence(source: String) {
+        // Evidence on an unhealthy launch is retained raw but never restores `connected`.
+        guard repoPromptMCPHealth == .unknown else { return }
+        repoPromptMCPHealth = .connected
+        writeRawEventLogRecord(kind: "mcp.health.connected", payload: ["source": source])
+    }
+
+    /// Applies an app-initiated loss of a RepoPrompt MCP connection. Only a loss of this
+    /// controller's run that proves ownership by its current registered launch counts: it must be
+    /// addressed to the current launch token, and either carry that launch's registered agent PID
+    /// (proven ancestry) or concern a connection admitted after that launch registered. Another
+    /// run, an earlier or later launch, no running launch, an unproven pre-existing connection,
+    /// and repeated deliveries are ignored. Never blocks: it only updates state and publishes the
+    /// degraded status.
+    package func noteRepoPromptMCPConnectionLost(_ loss: AgentMCPRunConnectionLoss) {
+        func ignore(_ why: String) {
+            #if DEBUG
+                debugRepoPromptMCPLossDecisions.append((loss.connectionID, why))
+            #endif
+            writeRawEventLogRecord(kind: "mcp.health.lossIgnored", payload: [
+                "reason": why,
+                "connectionID": loss.connectionID.uuidString,
+                "lossRunID": loss.runID.uuidString,
+                "lossLaunchToken": loss.launchToken.uuidString,
+                "lossReason": loss.reason.rawValue,
+                "closeReason": loss.closeReason
+            ])
+        }
+        guard loss.runID == runID else { return ignore("run_mismatch") }
+        guard process != nil, !isShuttingDown else { return ignore("no_current_launch") }
+        // stdout EOF retires the launch before its awaited tail, while `process` is still set.
+        if let retired = repoPromptMCPStdoutRetiredLaunchToken, retired == repoPromptMCPLaunchToken {
+            return ignore("stdout_retired")
+        }
+        guard let currentToken = repoPromptMCPLaunchToken,
+              let launch = runConnectionLossObserverLaunch,
+              launch.token == currentToken,
+              loss.launchToken == currentToken
+        else {
+            return ignore("stale_launch")
+        }
+        guard loss.provesOwnership(by: launch) else {
+            return ignore(loss.agentProcessID == nil ? "unproven_predates_launch" : "agent_pid_mismatch")
+        }
+        guard repoPromptMCPLostConnectionIDs.insert(loss.connectionID).inserted else {
+            return ignore("duplicate")
+        }
+        guard !repoPromptMCPHealth.isUnhealthy else { return ignore("already_unhealthy") }
+        #if DEBUG
+            debugRepoPromptMCPLossDecisions.append((loss.connectionID, "applied"))
+        #endif
+        repoPromptMCPHealth = .unhealthy(reason: loss.reason.rawValue)
+        var payload: [String: Any] = [
+            "reason": loss.reason.rawValue,
+            "closeReason": loss.closeReason,
+            "connectionID": loss.connectionID.uuidString,
+            "agentProcessIDProven": loss.agentProcessID != nil,
+            "reportedMcpServerStatuses": latestRuntimeInitMcpServerStatuses
+        ]
+        if let toolName = loss.toolName {
+            payload["toolName"] = toolName
+        }
+        writeRawEventLogRecord(kind: "mcp.health.unhealthy", payload: payload)
+        emit(.error(Self.repoPromptMCPDisconnectedMessage(for: loss)))
+        publishRuntimeInitIfChanged()
+    }
+
+    static let repoPromptMCPProbeSupersededReason = "Claude restarted while waiting for RepoPrompt MCP"
+
+    /// Waits (bounded) for fresh evidence that this launch's RepoPrompt MCP server is connected,
+    /// before a turn is submitted on it. Polls `mcp_status` (a read-only control request); a CLI
+    /// that rejects it or never answers it falls back to the app's authoritative live run route for
+    /// this run. A missing RepoPrompt entry or `pending` keeps waiting until the deadline; only an
+    /// explicit `failed` / `needs-auth` ends the wait early.
+    ///
+    /// The evidence is bound to the launch current at entry: after every suspension the probe
+    /// re-checks that launch, and if it was replaced it reports not connected and records nothing,
+    /// so one launch's evidence can never mark its successor connected.
+    package func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval = 0.25
+    ) async -> RepoPromptMCPConnectionProbeOutcome {
+        guard let probeLaunchToken = repoPromptMCPLaunchToken else {
+            return .notConnected("Claude process is not running")
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(Int64(max(0, timeoutSeconds) * 1000)))
+        var lastStatus = "unreported"
+        var useAppRoute = false
+        /// The probed launch is no longer the current one (shut down or replaced).
+        func launchReplaced() -> Bool {
+            repoPromptMCPLaunchToken != probeLaunchToken
+        }
+        func superseded() -> RepoPromptMCPConnectionProbeOutcome {
+            writeRawEventLogRecord(kind: "mcp.health.probeSuperseded", payload: [
+                "probeLaunchToken": probeLaunchToken.uuidString
+            ])
+            return .notConnected(Self.repoPromptMCPProbeSupersededReason)
+        }
+        while true {
+            guard !launchReplaced() else { return superseded() }
+            guard process != nil, isInitialized, !isShuttingDown else {
+                return .notConnected("Claude process is not running")
+            }
+            if case let .unhealthy(reason) = repoPromptMCPHealth {
+                return .notConnected(reason)
+            }
+            if repoPromptMCPHealth == .connected {
+                return .connected
+            }
+            if useAppRoute {
+                let hasRoute: Bool = if let clientName = config.runtimeVariant.agentKind.mcpClientNameHint {
+                    await mcpHost.hasAuthoritativeLiveRunRoute(runID: runID, expectedClientName: clientName)
+                } else {
+                    false
+                }
+                guard !launchReplaced() else { return superseded() }
+                if hasRoute {
+                    noteRepoPromptMCPConnectedEvidence(source: "app_run_route")
+                    continue
+                }
+                lastStatus = "no live run route"
+            } else {
+                let remaining = clock.now.duration(to: deadline)
+                let requestTimeout = max(0.5, min(5.0, Double(remaining.components.seconds) + 0.5))
+                let response: [String: Any]
+                do {
+                    response = try await sendControlRequest(
+                        request: ["subtype": "mcp_status"],
+                        timeoutSeconds: requestTimeout
+                    )
+                } catch ControllerError.invalidControlResponse {
+                    guard !launchReplaced() else { return superseded() }
+                    // An older CLI without `mcp_status`: use the app-side admission evidence.
+                    useAppRoute = true
+                    continue
+                } catch ControllerError.controlRequestTimedOut {
+                    guard !launchReplaced() else { return superseded() }
+                    // A CLI that ignores unknown control requests: same fallback.
+                    lastStatus = "mcp_status unanswered"
+                    useAppRoute = true
+                    continue
+                } catch {
+                    guard !launchReplaced() else { return superseded() }
+                    return .notConnected("mcp_status failed: \(error.localizedDescription)")
+                }
+                guard !launchReplaced() else { return superseded() }
+                let status = Self.repoPromptStatus(inMCPStatusResponse: response)
+                lastStatus = status ?? "absent"
+                switch status?.lowercased() {
+                case "connected":
+                    noteRepoPromptMCPConnectedEvidence(source: "mcp_status")
+                    continue
+                case "failed", "needs-auth", "needs_auth":
+                    return .notConnected("RepoPrompt MCP status \(lastStatus)")
+                default:
+                    // `pending`, not yet listed, or not yet reported: keep waiting.
+                    break
+                }
+            }
+            guard clock.now < deadline else {
+                return .notConnected("timed out waiting for RepoPrompt MCP (last status: \(lastStatus))")
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(Int64(max(0.01, pollIntervalSeconds) * 1000)))
+            } catch {
+                return .notConnected("cancelled")
+            }
+        }
+    }
+
+    /// Registers the loss observer for the current launch (token + the PID registered as the
+    /// run's expected agent process). A registration for an earlier launch is replaced.
+    private func registerRunConnectionLossObserverIfNeeded(expectedAgentPID pid: pid_t) async {
+        // Only Agent Mode run launches (owned by the Claude Agent Mode coordinator, which has the
+        // recovery path) observe connection loss.
+        guard config.toolContext == .agentRun, let launchToken = repoPromptMCPLaunchToken else { return }
+        let launch = AgentMCPRunLaunchIdentity(token: launchToken, agentProcessID: pid)
+        guard runConnectionLossObserverLaunch != launch else { return }
+        await unregisterRunConnectionLossObserverIfNeeded()
+        let token = await mcpHost.registerRunConnectionLossObserver(for: runID, launch: launch) { [weak self] loss in
+            await self?.noteRepoPromptMCPConnectionLost(loss)
+        }
+        // The launch may have been replaced, or another registration won, across the await.
+        guard runConnectionLossObserverToken == nil, repoPromptMCPLaunchToken == launchToken else {
+            await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: token)
+            return
+        }
+        runConnectionLossObserverToken = token
+        runConnectionLossObserverLaunch = launch
+    }
+
+    private func unregisterRunConnectionLossObserverIfNeeded() async {
+        guard let token = runConnectionLossObserverToken else { return }
+        runConnectionLossObserverToken = nil
+        runConnectionLossObserverLaunch = nil
+        await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: token)
+    }
+
     // MARK: - Runtime init aggregation helpers
 
     /// Builds and emits a merged `RuntimeInitStatus` from all available sources.
@@ -2748,8 +3120,12 @@ package final actor ClaudeNativeProcessSessionController {
         let status = RuntimeInitStatus(
             sessionID: sessionID,
             tools: latestRuntimeInitTools,
-            mcpServerStatuses: latestRuntimeInitMcpServerStatuses,
-            initializeResponse: initializeResponseSnapshot
+            mcpServerStatuses: Self.overlayingRepoPromptMCPHealth(
+                repoPromptMCPHealth,
+                on: latestRuntimeInitMcpServerStatuses
+            ),
+            initializeResponse: initializeResponseSnapshot,
+            repoPromptMCPHealth: repoPromptMCPHealth
         )
         guard status != lastEmittedRuntimeInitStatus else { return }
         lastEmittedRuntimeInitStatus = status
@@ -3096,13 +3472,40 @@ package final actor ClaudeNativeProcessSessionController {
             _ spawned: SpawnedProcess,
             initialized: Bool = true
         ) {
+            // As at a production spawn: a new launch starts with fresh health and a new token.
+            resetRepoPromptMCPHealthForLaunch()
             process = spawned
+            installSpawnLaunchTokens(UUID())
             if initialized {
                 completeInitialization()
             } else {
                 isInitialized = false
             }
             isShuttingDown = false
+        }
+
+        func test_currentRepoPromptMCPLaunchToken() -> UUID? {
+            repoPromptMCPLaunchToken
+        }
+
+        /// The synchronous first step of `handleStdoutEOF` for the attached launch: the stdout
+        /// generation is retired while `process` is still set (the EOF tail has not run yet).
+        func test_retireActiveStdoutLaunchForCurrentLaunch() {
+            guard let token = repoPromptMCPLaunchToken else { return }
+            retireActiveStdoutLaunch(token)
+        }
+
+        func test_currentRunConnectionLossObserverLaunch() -> AgentMCPRunLaunchIdentity? {
+            runConnectionLossObserverLaunch
+        }
+
+        func test_repoPromptMCPLossDecisions() -> [(connectionID: UUID, decision: String)] {
+            debugRepoPromptMCPLossDecisions
+        }
+
+        /// Runs the production expected-PID + loss-observer registration for the attached launch.
+        func test_registerExpectedAgentPID(_ pid: pid_t) async {
+            await registerExpectedAgentPIDIfNeeded(pid)
         }
 
         func test_currentUsageLaunchToken() -> UUID? {
@@ -3372,7 +3775,7 @@ package final actor ClaudeNativeProcessSessionController {
             ])
             return
         }
-        activeStdoutLaunchToken = nil
+        retireActiveStdoutLaunch(launchToken)
         writeRawEventLogRecord(kind: "process.stdoutEOF")
         var remainingLines: [Data] = []
         stdoutFramer.flush { line in
@@ -4144,6 +4547,10 @@ package final actor ClaudeNativeProcessSessionController {
             return
         }
         registeredExpectedAgentPID = pid
+        // The loss observer registers first, in the first manager call after spawn: this launch's
+        // helper only connects once Claude has booted and started it, so its connection is not
+        // recorded as predating this launch's observer (no extra hop for it to slip into).
+        await registerRunConnectionLossObserverIfNeeded(expectedAgentPID: pid)
         await mcpHost.registerExpectedAgentPID(
             pid,
             for: clientName,
@@ -4152,6 +4559,7 @@ package final actor ClaudeNativeProcessSessionController {
             expectedProcessExecutableIdentity: nil
         )
         if isShuttingDown {
+            await unregisterRunConnectionLossObserverIfNeeded()
             await mcpHost.clearExpectedAgentPID(pid, for: clientName, runID: runID)
             if registeredExpectedAgentPID == pid {
                 registeredExpectedAgentPID = nil

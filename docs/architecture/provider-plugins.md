@@ -364,8 +364,17 @@ protocol NativeAgentRuntimeControlling: Actor {
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
+    // RepoPrompt MCP health of the current launch; defaults to `.unknown` (never recovered).
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth { get async }
+    // Bounded wait for fresh connected evidence; the default never reports connected.
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome
 }
 ```
+
+Protocol-extension defaults (`emitEventMarker(_:)`, the MCP health members, and similar) are statically dispatched when called on a concrete controller type that doesn't declare them in its own body; call through `any NativeAgentRuntimeControlling` in tests, as the runner does, so the actor's witnesses are used.
 
 The associated event/session/turn types are currently `typealias`es over the Claude-native runtime DTOs (`NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event`, etc.). When a second native provider arrives, the aliases will become proper neutral DTOs and the Claude controller will conform via its own mapping. Until then the alias layer keeps the seam ergonomic without forcing churn on coordinators, runners, and tab-session storage.
 
