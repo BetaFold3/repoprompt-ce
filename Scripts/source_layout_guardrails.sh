@@ -396,6 +396,7 @@ allowed_tracked_docs=(
   "docs/context/archive/2026-07-30-AGENTS.md"
   "docs/context/archive/2026-07-30-CLAUDE.md"
   "docs/context/archive/MANIFEST.md"
+  "docs/context/claude-mcp-connection-health.md"
   "docs/context/claude-model-family-catalog.md"
   "docs/context/codemap-source-authority-recovery.md"
   "docs/context/gpt-model-catalog.md"
