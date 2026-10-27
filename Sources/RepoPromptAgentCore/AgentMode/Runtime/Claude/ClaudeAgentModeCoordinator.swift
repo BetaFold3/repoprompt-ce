@@ -356,6 +356,14 @@ package final class ClaudeAgentModeCoordinator {
         return await (controller, controller.eventsSubscription())
     }
 
+    /// The PID of the session's current, healthy Claude launch's spawned process, bound to its
+    /// RepoPrompt MCP launch token, or `nil`. It may not be registered for RepoPrompt MCP routing
+    /// yet (the host's proof then fails and the turn waits).
+    func repoPromptMCPLaunchAgentPID(for session: AgentTabSession) async -> pid_t? {
+        guard let controller = session.claudeController else { return nil }
+        return await controller.repoPromptMCPLaunchAgentPID
+    }
+
     func hasTurnInFlight(for session: AgentTabSession) async -> Bool {
         guard let controller = session.claudeController else { return false }
         return await controller.hasTurnInFlight

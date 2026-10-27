@@ -342,5 +342,308 @@ class ClaudeTranscriptTests(unittest.TestCase):
             live.find_claude_transcript(Path("."), "../escape")
 
 
+class LaterTurnRouteTests(unittest.TestCase):
+    def test_the_scenario_is_registered_with_the_helper_exit_marker(self) -> None:
+        self.assertIn("laterturn-kill", live.SCENARIOS)
+        self.assertEqual(live.REASON_MARKERS["laterturn-kill"], "the RepoPrompt MCP helper process exited")
+        self.assertGreater(live.LATERTURN_ROUTE_CHECK_SECONDS, 10.0, "must outlast the 10 s routing wait")
+
+    def test_a_still_routed_connection_yields_its_helper(self) -> None:
+        helper, detail = live.preserved_route_helper(
+            [row(OTHER_CONNECTION, ancestors=[4100, 3000]), row()],
+            live.uuid_key(CONNECTION),
+            {RUN.lower()},
+        )
+        self.assertIsNotNone(helper)
+        self.assertEqual(helper.connection_id, CONNECTION.lower())
+        self.assertEqual((helper.pid, helper.claude_pid), (5000, 4000))
+        self.assertIn("run_id=", detail)
+
+    def test_an_unrouted_rerouted_missing_or_malformed_connection_yields_none(self) -> None:
+        connection = live.uuid_key(CONNECTION)
+        run_ids = {RUN.lower()}
+        cases = {
+            "unrouted": [row(run_id=None)],
+            "another run": [row(run_id="7F1C2A4B-0C1D-4E5F-8A9B-0C1D2E3F4A5B")],
+            "missing": [row(OTHER_CONNECTION)],
+            "no helper identity": [row(helper_ancestor_pids=[])],
+        }
+        for name, rows in cases.items():
+            with self.subTest(name):
+                helper, detail = live.preserved_route_helper(rows, connection, run_ids)
+                self.assertIsNone(helper)
+                self.assertIn(connection, detail)
+
+    def test_remaining_wait_counts_from_the_submit_time(self) -> None:
+        self.assertEqual(live.remaining_wait(100.0, 104.0, 15.0), 11.0)
+        self.assertEqual(live.remaining_wait(100.0, 115.0, 15.0), 0.0)
+        self.assertEqual(live.remaining_wait(100.0, 130.0, 15.0), 0.0)
+
+    def test_turn_two_must_reuse_the_same_helper_instance(self) -> None:
+        turn1 = live.helper_from_row(row())
+        self.assertIsNotNone(turn1)
+        self.assertTrue(live.same_helper_instance(turn1, live.helper_from_row(row())))
+        others = {
+            "another connection": row(OTHER_CONNECTION),
+            "another pid": row(helper_peer_pid=5001),
+            "another start": row(helper_process_start="1761400999.000001"),
+        }
+        for name, other in others.items():
+            with self.subTest(name):
+                self.assertFalse(live.same_helper_instance(turn1, live.helper_from_row(other)))
+
+
+def routing_event(seq: int, name: str, **fields: str) -> dict:
+    return {"seq": seq, "event": name, "run_id": RUN, "connection_id": None, "fields": fields}
+
+
+class RetentionRoutingHistoryTests(unittest.TestCase):
+    def test_an_early_release_or_a_preserving_revocation_passes(self) -> None:
+        for name in live.RETENTION_EARLY_RELEASE_EVENTS:
+            with self.subTest(name):
+                verdict, detail = live.retention_routing_verdict([routing_event(11, name)], 10)
+                self.assertIs(verdict, True)
+                self.assertIn(name, detail)
+        verdict, _ = live.retention_routing_verdict(
+            [routing_event(11, "policy_revoked", client_name="claude-code", routing_preserved="true")], 10
+        )
+        self.assertIs(verdict, True)
+
+    def test_a_clearing_revocation_fails(self) -> None:
+        verdict, detail = live.retention_routing_verdict(
+            [routing_event(11, "policy_revoked", routing_preserved="false")], 10
+        )
+        self.assertIs(verdict, False)
+        self.assertIn("routing cleared", detail)
+
+    def test_the_old_unconditional_cleanup_fails(self) -> None:
+        # Before route retention, `policy_revoked` carried only the client and window.
+        verdict, detail = live.retention_routing_verdict(
+            [routing_event(11, "policy_revoked", client_name="claude-code", window_id="1")], 10
+        )
+        self.assertIs(verdict, False)
+        self.assertIn("routing_preserved=None", detail)
+
+    def test_a_clearing_revocation_outweighs_a_kept_route(self) -> None:
+        verdict, _ = live.retention_routing_verdict(
+            [
+                routing_event(11, "route_wait_skipped_proven_route"),
+                routing_event(12, "policy_revoked", routing_preserved="false"),
+            ],
+            10,
+        )
+        self.assertIs(verdict, False)
+
+    def test_events_up_to_the_baseline_and_unrelated_events_are_ignored(self) -> None:
+        events = [
+            routing_event(9, "policy_revoked", routing_preserved="false"),
+            routing_event(10, "route_wait_skipped_proven_route"),
+            routing_event(11, "route_wait_started"),
+            {"seq": "12", "event": "policy_revoked", "fields": {"routing_preserved": "false"}},
+        ]
+        verdict, detail = live.retention_routing_verdict(events, 10)
+        self.assertIsNone(verdict)
+        self.assertIn("no lease outcome", detail)
+
+    def test_the_early_release_path_needs_both_events(self) -> None:
+        events = [
+            routing_event(11, "policy_released_for_proven_route"),
+            routing_event(12, "route_wait_skipped_proven_route"),
+        ]
+        ok, detail = live.later_turn_routing_path(events, 10)
+        self.assertIs(ok, True)
+        self.assertIn("early release", detail)
+        ok, detail = live.later_turn_routing_path(events[:1], 10)
+        self.assertIs(ok, False)
+        self.assertIn("incomplete early release", detail)
+
+    def test_the_wait_path_fails_with_a_clear_reason(self) -> None:
+        ok, detail = live.later_turn_routing_path(
+            [routing_event(11, "policy_revoked", routing_preserved="true", pruned_connection_count="0")], 10
+        )
+        self.assertIs(ok, False)
+        self.assertIn("early release did not apply; 10 s wait path", detail)
+
+    def test_the_wait_path_after_a_prune_that_removed_the_window_mapping_is_the_documented_fallback(self) -> None:
+        for prune in (
+            routing_event(
+                5, "policy_revoked", routing_preserved="true", pruned_connection_count="1", window_mapping_removed="true"
+            ),
+            routing_event(
+                9, "routing_cleanup_if_unproven", routing_preserved="true", pruned_connection_count="2",
+                window_mapping_removed="true",
+            ),
+            routing_event(10, "proof_lost_routes_unrouted", unrouted_connection_count="1", window_mapping_removed="true"),
+        ):
+            with self.subTest(prune["event"]):
+                # The run's route was assigned in turn 1 (seq 3); the prune came after it.
+                events = [
+                    routing_event(3, "policy_applied"),
+                    prune,
+                    routing_event(11, "policy_revoked", routing_preserved="true", pruned_connection_count="0"),
+                ]
+                ok, detail = live.later_turn_routing_path(events, 10)
+                self.assertIs(ok, True)
+                self.assertIn("documented fallback after a prune removed the window mapping", detail)
+
+    def test_a_prune_excuses_the_wait_path_only_after_the_runs_last_route_assignment(self) -> None:
+        prune = routing_event(5, "proof_lost_routes_unrouted", unrouted_connection_count="1", window_mapping_removed="true")
+        revoke = routing_event(11, "policy_revoked", routing_preserved="true", pruned_connection_count="0")
+        excused_detail = "documented fallback after a prune removed the window mapping"
+        for label, events, after_seq, excused in (
+            ("after the last assignment", [routing_event(3, "policy_applied"), prune, revoke], 10, True),
+            ("a later assignment re-created the mapping", [routing_event(3, "policy_applied"), prune,
+                                                          routing_event(7, "policy_applied"), revoke], 10, False),
+            ("no assignment, before the turn boundary", [prune, revoke], 10, False),
+            ("no assignment, after the turn boundary", [prune, revoke], 4, True),
+            ("an assignment after the revoke does not move the bound", [routing_event(3, "policy_applied"), prune,
+                                                                       revoke, routing_event(12, "policy_applied")],
+             10, True),
+            ("a later live-affinity restore re-created the mapping",
+             [routing_event(3, "policy_applied"), prune, routing_event(7, "live_affinity_route_restored"), revoke],
+             10, False),
+            ("after a live-affinity restore", [routing_event(3, "live_affinity_route_restored"), prune, revoke], 10, True),
+        ):
+            with self.subTest(label):
+                ok, detail = live.later_turn_routing_path(events, after_seq)
+                self.assertIs(ok, excused)
+                if excused:
+                    self.assertIn(excused_detail, detail)
+                else:
+                    self.assertIn("early release did not apply; 10 s wait path", detail)
+
+    def test_a_request_path_filling_the_empty_slot_is_a_route_assignment_and_a_yield_is_not(self) -> None:
+        prune = routing_event(5, "proof_lost_routes_unrouted", unrouted_connection_count="1", window_mapping_removed="true")
+        revoke = routing_event(11, "policy_revoked", routing_preserved="true", pruned_connection_count="0")
+        for label, later, excused in (
+            ("the kept helper's rebind filled the empty slot", routing_event(7, "run_tab_rebound_empty_slot", source="tool_call"), False),
+            ("the rebind yielded to a different holder", routing_event(7, "tab_rebind_yielded_to_holder", source="tool_call"), True),
+            ("the run mapping yielded to a different holder",
+             routing_event(7, "run_mapping_yielded_to_holder", source="tool_call_affinity_restore"), True),
+        ):
+            with self.subTest(label):
+                ok, detail = live.later_turn_routing_path([routing_event(3, "policy_applied"), prune, later, revoke], 10)
+                self.assertIs(ok, excused)
+                if excused:
+                    self.assertIn("documented fallback after a prune removed the window mapping", detail)
+                else:
+                    self.assertIn("early release did not apply; 10 s wait path", detail)
+
+    def test_a_prune_excuses_the_wait_path_only_when_it_removed_the_window_mapping_first(self) -> None:
+        revoke = routing_event(11, "policy_revoked", routing_preserved="true", pruned_connection_count="0")
+        for label, prune in (
+            ("mapping kept", routing_event(5, "policy_revoked", routing_preserved="true", pruned_connection_count="1",
+                                           window_mapping_removed="false")),
+            ("no field", routing_event(5, "policy_revoked", routing_preserved="true", pruned_connection_count="1")),
+            ("after the revoke", routing_event(12, "proof_lost_routes_unrouted", unrouted_connection_count="1",
+                                               window_mapping_removed="true")),
+            ("zero count", routing_event(5, "policy_revoked", routing_preserved="true", pruned_connection_count="0",
+                                         window_mapping_removed="true")),
+            ("negative count", routing_event(5, "policy_revoked", routing_preserved="true", pruned_connection_count="-1",
+                                             window_mapping_removed="true")),
+            ("non-integer count", routing_event(5, "policy_revoked", routing_preserved="true", pruned_connection_count="1.5",
+                                                window_mapping_removed="true")),
+        ):
+            with self.subTest(label):
+                # After the run's turn-1 route assignment (seq 3), so only the prune's fields decide.
+                ok, detail = live.later_turn_routing_path([routing_event(3, "policy_applied"), prune, revoke], 10)
+                self.assertIs(ok, False)
+                self.assertIn("early release did not apply; 10 s wait path", detail)
+
+    def test_positive_count_accepts_only_positive_integers(self) -> None:
+        self.assertEqual(live.positive_count("3"), 3)
+        self.assertEqual(live.positive_count(2), 2)
+        for value in ("0", "-1", "1.0", "", " 1", "x", None, True, 0, -2, "\u0661"):
+            with self.subTest(repr(value)):
+                self.assertIsNone(live.positive_count(value))
+
+    def test_a_clearing_revocation_or_no_outcome_is_not_the_early_release(self) -> None:
+        ok, detail = live.later_turn_routing_path([routing_event(11, "policy_revoked", routing_preserved="false")], 10)
+        self.assertIs(ok, False)
+        self.assertIn("routing cleared", detail)
+        ok, detail = live.later_turn_routing_path(
+            [routing_event(9, "route_wait_skipped_proven_route"), routing_event(10, "policy_released_for_proven_route")], 10
+        )
+        self.assertIsNone(ok)
+        self.assertIn("no lease outcome", detail)
+
+    def with_raw_call(self, returncode: int, stdout: object, stderr: str = ""):
+        """Patches the diagnostics CLI call for one test; `stdout` is JSON-encoded unless bytes."""
+        original = live.diagnostics_raw_call
+        body = stdout if isinstance(stdout, bytes) else json.dumps(stdout).encode()
+
+        def raw_call(*_args, **_kwargs):
+            return returncode, body, stderr.encode()
+
+        live.diagnostics_raw_call = raw_call
+        self.addCleanup(setattr, live, "diagnostics_raw_call", original)
+
+    def history(self):
+        return live.routing_history(Path("/nonexistent"), 1, {RUN.lower()})
+
+    def test_a_supported_lookup_returns_events_and_the_latest_sequence(self) -> None:
+        self.with_raw_call(0, {"ok": True, "op": "run_routing_history", "events": [routing_event(3, "x")], "latest_seq": 7})
+        events, latest = self.history()
+        self.assertEqual((len(events), latest), (1, 7))
+
+    def test_an_unknown_op_is_unsupported(self) -> None:
+        self.with_raw_call(0, {"ok": False, "op": "run_routing_history", "code": "unknown_op", "error": "Unknown debug diagnostics op: run_routing_history"})
+        with self.assertRaises(live.RoutingHistoryUnsupported):
+            self.history()
+
+    def test_an_unknown_tool_is_unsupported(self) -> None:
+        # A non-DEBUG build has no diagnostics tool at all.
+        self.with_raw_call(1, b"", "Unknown tool: __repoprompt_debug_diagnostics")
+        with self.assertRaises(live.RoutingHistoryUnsupported):
+            self.history()
+
+    def test_a_failed_supported_lookup_is_a_failure_not_unsupported(self) -> None:
+        cases = [
+            ("error payload", 0, {"ok": False, "op": "run_routing_history", "code": "internal", "error": "boom"}, ""),
+            ("nonzero exit", 1, b"", "connection refused"),
+            ("malformed JSON", 0, b"{not json", ""),
+            ("missing latest_seq", 0, {"ok": True, "op": "run_routing_history", "events": []}, ""),
+            ("events not a list", 0, {"ok": True, "op": "run_routing_history", "events": {}, "latest_seq": 1}, ""),
+        ]
+        for name, returncode, stdout, stderr in cases:
+            with self.subTest(name):
+                self.with_raw_call(returncode, stdout, stderr)
+                with self.assertRaises(live.LiveAcceptanceError) as raised:
+                    self.history()
+                self.assertNotIsInstance(raised.exception, live.RoutingHistoryUnsupported)
+
+    def test_required_history_fails_the_check_with_a_clear_reason(self) -> None:
+        cases = [
+            ("unsupported", 0, {"ok": False, "op": "run_routing_history", "code": "unknown_op", "error": "x"}, "DEBUG CE build"),
+            ("failed", 1, b"", "lookup failed"),
+        ]
+        for name, returncode, stdout, reason in cases:
+            with self.subTest(name):
+                self.with_raw_call(returncode, stdout, "connection refused")
+                result = live.ScenarioResult("laterturn-kill")
+                with self.assertRaises(live.LiveAcceptanceError) as raised:
+                    live.required_routing_history(
+                        result, Path("/nonexistent"), 1, {RUN.lower()}, "routing history shows turn 2 kept the route",
+                        "after turn 2 (the pre-turn lookup succeeded)",
+                    )
+                self.assertIn(reason, str(raised.exception))
+                self.assertIn("nothing killed", str(raised.exception))
+                self.assertEqual(result.checks[-1][0], "routing history shows turn 2 kept the route")
+                self.assertIs(result.checks[-1][1], False)
+                self.assertIn("after turn 2", result.checks[-1][2])
+                self.assertFalse(result.passed)
+
+    def test_a_post_turn_failure_after_a_successful_pre_turn_lookup_fails(self) -> None:
+        result = live.ScenarioResult("laterturn-kill")
+        self.with_raw_call(0, {"ok": True, "op": "run_routing_history", "events": [], "latest_seq": 4})
+        before = live.required_routing_history(result, Path("/nonexistent"), 1, {RUN.lower()}, "before", "before turn 2")
+        self.assertEqual(before[1], 4)
+        self.with_raw_call(1, b"", "timed out")
+        with self.assertRaises(live.LiveAcceptanceError):
+            live.required_routing_history(result, Path("/nonexistent"), 1, {RUN.lower()}, "after", "after turn 2")
+        self.assertEqual([(name, ok) for name, ok, _ in result.checks], [("after", False)])
+        self.assertFalse(result.passed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

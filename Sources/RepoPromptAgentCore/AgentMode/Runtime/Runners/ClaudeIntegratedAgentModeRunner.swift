@@ -210,7 +210,22 @@ final class ClaudeIntegratedAgentModeRunner {
 
                 self.hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
                 self.hooks.markAttachmentsConsumed(session, attachmentReservationID)
-                _ = await lease.releaseWhenRouted()
+                // This run's events are held by the tab's router until `consumeEvents` below. A
+                // later turn on a launch that kept its helper gets no new connection, so when the
+                // run's route is proven to belong to this launch the routing wait is skipped; a
+                // first or restarted launch still waits for its new helper to be routed.
+                let launchAgentPID = await self.claudeCoordinator.repoPromptMCPLaunchAgentPID(for: session)
+                var releasedForProvenRoute = false
+                if let launchAgentPID {
+                    releasedForProvenRoute = await lease.releaseWithProvenExistingRoute(agentPID: launchAgentPID)
+                } else {
+                    #if DEBUG
+                        await lease.debugRecordProvenRouteReleaseSkipped(reason: "launch_agent_pid_unavailable")
+                    #endif
+                }
+                if !releasedForProvenRoute {
+                    _ = await lease.releaseWhenRouted()
+                }
 
                 guard let subscribed = await self.claudeCoordinator.eventSubscription(for: session) else {
                     await self.finalize(

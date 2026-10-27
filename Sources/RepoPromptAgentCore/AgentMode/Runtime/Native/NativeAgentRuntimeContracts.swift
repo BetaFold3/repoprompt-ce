@@ -51,6 +51,13 @@ package protocol NativeAgentRuntimeControlling: Actor {
     /// RepoPrompt MCP health of the current launch. Runtimes without health tracking report
     /// `.unknown` and are never recovered for MCP health.
     var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth { get async }
+    /// The PID of the current, healthy launch's spawned agent process, bound to that launch's
+    /// RepoPrompt MCP launch token, or `nil` (no running launch, shutting down, or unhealthy). It
+    /// may not be registered as the run's expected MCP agent yet; the host proves a route only
+    /// against a registered instance, so an unregistered PID never skips the wait. A later turn may
+    /// skip its routing wait only for a route proven to belong to this launch. Runtimes without
+    /// it report `nil` and always wait.
+    var repoPromptMCPLaunchAgentPID: pid_t? { get async }
     /// Bounded wait for fresh RepoPrompt MCP connected evidence on the current launch. Runtimes
     /// without such evidence never report `connected`.
     func awaitRepoPromptMCPConnectedEvidence(
@@ -87,6 +94,10 @@ extension NativeAgentRuntimeControlling {
 
     var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
         get async { .unknown }
+    }
+
+    var repoPromptMCPLaunchAgentPID: pid_t? {
+        get async { nil }
     }
 
     func awaitRepoPromptMCPConnectedEvidence(

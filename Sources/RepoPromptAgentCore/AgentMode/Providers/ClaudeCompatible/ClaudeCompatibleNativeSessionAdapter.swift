@@ -99,6 +99,12 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         get async { await controller.currentRepoPromptMCPHealth }
     }
 
+    /// Forwarded like the health: without it the protocol default (`nil`) would make every later
+    /// Claude turn take the 10 s routing wait instead of the proven-route early release.
+    var repoPromptMCPLaunchAgentPID: pid_t? {
+        get async { await controller.repoPromptMCPLaunchAgentPID }
+    }
+
     func awaitRepoPromptMCPConnectedEvidence(
         timeoutSeconds: TimeInterval,
         pollIntervalSeconds: TimeInterval

@@ -579,7 +579,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             connectionID: connectionID,
             clientName: clientName,
             windowID: window.windowID,
-            runPurpose: .agentModeRun
+            runPurpose: .agentModeRun,
+            actorRoutedRunTab: nil
         ))
         defer { window.mcpServer.setRequestMetadataOverrideForTesting(nil) }
 
@@ -1378,7 +1379,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-coalescing-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
 
             let resolutionGate = TokenAccountingGate()
@@ -1488,7 +1490,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-publication-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
 
             let postValidationGate = TokenAccountingGate()
@@ -1660,7 +1663,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
             window.mcpServer.resetFileToolLookupContextCacheStatsForTesting()
 
@@ -1846,7 +1850,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "selection-reply-compatibility-test",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
 
         var bindingState = AgentSessionWorktreeBindingState.unavailable

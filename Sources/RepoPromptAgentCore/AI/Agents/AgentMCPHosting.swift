@@ -6,7 +6,34 @@ import MCP
 package protocol AgentMCPHosting: Sendable {
     func isRunning() async -> Bool
 
-    func hasAuthoritativeLiveRunRoute(runID: UUID, expectedClientName: String) async -> Bool
+    /// Whether the run has a committed, live, admitted route for `expectedClientName`.
+    /// A non-nil `requiredAgentPID` binds the evidence to that launch: the routed connection must
+    /// be live and non-terminal, and its helper must descend from exactly the agent process
+    /// instance registered for that PID (a route retained from an earlier launch of the same run
+    /// proves nothing about a restarted launch). `nil` keeps the launch-independent check.
+    func hasAuthoritativeLiveRunRoute(runID: UUID, expectedClientName: String, requiredAgentPID: pid_t?) async -> Bool
+
+    /// Turn-start delivery of a newly installed run policy to the run's retained, ownership-proven
+    /// helper connections (Claude native clients only; a no-op for every other client), one
+    /// `tools/list_changed` per connection whose applied projection differs. Called by the
+    /// bootstrap lease after it released the global gate and before the turn's message is sent.
+    func refreshRetainedRunPolicyForTurnStart(for clientName: String, runID: UUID) async
+
+    /// For a later turn whose launch keeps its helper: when the run already has a live route whose
+    /// helper is proven (as `hasAuthoritativeLiveRunRoute` with `requiredAgentPID`) to belong to
+    /// `agentPID`'s launch and no application of the run's policy is in flight, first clears the
+    /// turn's unused pending policy (its queue entry, removed synchronously with those checks),
+    /// then brings every proven connection of the run to the run's current policy projection,
+    /// keeps routing state, and returns true. Returns false without changing anything when the
+    /// checks fail before the clear; a false after the clear (the projection changed or the
+    /// launch's route lost its proof during the refresh) means the entry is already gone, and the
+    /// caller's routing wait and its revocation finish the turn (Claude native clients only).
+    func releasePendingRunPolicyForProvenRoute(
+        for clientName: String,
+        windowID: Int,
+        runID: UUID,
+        agentPID: pid_t
+    ) async -> Bool
 
     func waitForNewConnection(clientName: String?, timeout: TimeInterval) async -> UUID?
 
@@ -44,6 +71,12 @@ package protocol AgentMCPHosting: Sendable {
     func clearClientConnectionPolicy(for clientName: String, windowID: Int?, runID: UUID?) async
 
     func revokeClientConnectionPolicy(for clientName: String, windowID: Int, runID: UUID) async
+
+    /// The routing half of `revokeClientConnectionPolicy`, never touching a pending policy: clears
+    /// the run's routing state when no live, ancestry-proven helper of the run remains, and
+    /// otherwise prunes its unproven routes. Used for failure or cancellation cleanup after an
+    /// early release (`releasePendingRunPolicyForProvenRoute`).
+    func cleanupRunRoutingIfUnproven(for clientName: String, windowID: Int, runID: UUID) async
 
     func registerToolEventObserver(
         for runID: UUID,

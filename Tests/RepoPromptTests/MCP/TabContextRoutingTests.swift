@@ -858,7 +858,7 @@ final class TabContextRoutingTests: XCTestCase {
 
         await window.mcpServer.persistResolvedTabContextSnapshot(
             resolved,
-            metadata: MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "test", windowID: window.windowID),
+            metadata: MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "test", windowID: window.windowID, actorRoutedRunTab: nil),
             mutated: true
         )
 
@@ -1370,7 +1370,8 @@ final class TabContextRoutingTests: XCTestCase {
             metadata: MCPServerViewModel.RequestMetadata(
                 connectionID: connectionID,
                 clientName: "clear-auto-reset-test",
-                windowID: window.windowID
+                windowID: window.windowID,
+                actorRoutedRunTab: nil
             ),
             mutated: true
         )
@@ -1386,7 +1387,8 @@ final class TabContextRoutingTests: XCTestCase {
             from: MCPServerViewModel.RequestMetadata(
                 connectionID: connectionID,
                 clientName: "clear-auto-reset-test",
-                windowID: window.windowID
+                windowID: window.windowID,
+                actorRoutedRunTab: nil
             ),
             toolName: "manage_selection",
             policy: .allowActiveTabCompatibility
@@ -1578,7 +1580,8 @@ final class TabContextRoutingTests: XCTestCase {
             connectionID: connectionID,
             clientName: "mutation-hydration-client",
             windowID: window.windowID,
-            runPurpose: .agentModeRun
+            runPurpose: .agentModeRun,
+            actorRoutedRunTab: nil
         )
         let initialSnapshot = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
         XCTAssertEqual(
@@ -1665,7 +1668,8 @@ final class TabContextRoutingTests: XCTestCase {
             connectionID: connectionID,
             clientName: "hydration-rebind-client",
             windowID: window.windowID,
-            runPurpose: .agentModeRun
+            runPurpose: .agentModeRun,
+            actorRoutedRunTab: nil
         )
         let lookupTask = Task { @MainActor in
             await window.mcpServer.resolveFileToolLookupContext(from: metadata)
@@ -1783,7 +1787,8 @@ final class TabContextRoutingTests: XCTestCase {
             connectionID: connectionID,
             clientName: "hydration-session-switch-client",
             windowID: window.windowID,
-            runPurpose: .agentModeRun
+            runPurpose: .agentModeRun,
+            actorRoutedRunTab: nil
         ))
 
         XCTAssertEqual(lookupContext, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
@@ -2459,7 +2464,8 @@ final class TabContextRoutingTests: XCTestCase {
                     windowStateIdentity: ObjectIdentifier(window),
                     serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
                     provenance: .hiddenWindowArgument
-                )
+                ),
+                actorRoutedRunTab: nil
             )
 
             let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2544,7 +2550,8 @@ final class TabContextRoutingTests: XCTestCase {
                     windowStateIdentity: ObjectIdentifier(window),
                     serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
                     provenance: .hiddenWindowArgument
-                )
+                ),
+                actorRoutedRunTab: nil
             )
 
             let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2668,7 +2675,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "explicit-agent-run",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             )
 
             let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2710,7 +2718,8 @@ final class TabContextRoutingTests: XCTestCase {
                 clientName: "run-scoped-window-only-agent-run",
                 windowID: window.windowID,
                 runPurpose: .agentModeRun,
-                explicitWindowRoutingHint: explicitWindowRoutingHint
+                explicitWindowRoutingHint: explicitWindowRoutingHint,
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2726,7 +2735,8 @@ final class TabContextRoutingTests: XCTestCase {
                 clientName: "discover-scoped-window-only-agent-run",
                 windowID: window.windowID,
                 runPurpose: .discoverRun,
-                explicitWindowRoutingHint: explicitWindowRoutingHint
+                explicitWindowRoutingHint: explicitWindowRoutingHint,
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync {
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2747,7 +2757,8 @@ final class TabContextRoutingTests: XCTestCase {
                     workspaceID: workspaceID,
                     windowID: window.windowID
                 ),
-                explicitWindowRoutingHint: explicitWindowRoutingHint
+                explicitWindowRoutingHint: explicitWindowRoutingHint,
+                actorRoutedRunTab: nil
             )
             let hintedParent = await window.mcpServer
                 .resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: hintedRunScopedMetadata)
@@ -2770,7 +2781,8 @@ final class TabContextRoutingTests: XCTestCase {
                 clientName: "missing-active-agent-run",
                 windowID: window.windowID,
                 runPurpose: .unknown,
-                explicitWindowRoutingHint: explicitWindowRoutingHint
+                explicitWindowRoutingHint: explicitWindowRoutingHint,
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2806,7 +2818,8 @@ final class TabContextRoutingTests: XCTestCase {
                     tabID: tabID,
                     workspaceID: workspaceID,
                     windowID: window.windowID + 1
-                )
+                ),
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2830,7 +2843,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "auto-routed-agent-run",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2865,14 +2879,16 @@ final class TabContextRoutingTests: XCTestCase {
                     clientName: "connection-mismatch-agent-run",
                     windowID: window.windowID,
                     runPurpose: .unknown,
-                    explicitWindowRoutingHint: hint(connectionID: UUID())
+                    explicitWindowRoutingHint: hint(connectionID: UUID()),
+                    actorRoutedRunTab: nil
                 ),
                 .init(
                     connectionID: connectionID,
                     clientName: "tool-mismatch-agent-run",
                     windowID: window.windowID,
                     runPurpose: .unknown,
-                    explicitWindowRoutingHint: hint(toolName: "read_file")
+                    explicitWindowRoutingHint: hint(toolName: "read_file"),
+                    actorRoutedRunTab: nil
                 ),
                 .init(
                     connectionID: connectionID,
@@ -2881,7 +2897,8 @@ final class TabContextRoutingTests: XCTestCase {
                     runPurpose: .unknown,
                     explicitWindowRoutingHint: hint(
                         windowStateIdentity: ObjectIdentifier(wrongIdentity)
-                    )
+                    ),
+                    actorRoutedRunTab: nil
                 ),
                 .init(
                     connectionID: connectionID,
@@ -2890,7 +2907,8 @@ final class TabContextRoutingTests: XCTestCase {
                     runPurpose: .unknown,
                     explicitWindowRoutingHint: hint(
                         serverViewModelIdentity: ObjectIdentifier(wrongIdentity)
-                    )
+                    ),
+                    actorRoutedRunTab: nil
                 )
             ]
             for metadata in mismatches {
@@ -2912,7 +2930,8 @@ final class TabContextRoutingTests: XCTestCase {
                 clientName: "effective-window-mismatch-agent-run",
                 windowID: window.windowID + 1,
                 runPurpose: .unknown,
-                explicitWindowRoutingHint: hint()
+                explicitWindowRoutingHint: hint(),
+                actorRoutedRunTab: nil
             )
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2969,7 +2988,8 @@ final class TabContextRoutingTests: XCTestCase {
                     tabID: activeTabID,
                     workspaceID: activeWorkspace.id,
                     windowID: window.windowID + 1
-                )
+                ),
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -2985,7 +3005,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: autoRoutedConnectionID,
                 clientName: "public-start-auto-routed-only",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -3009,7 +3030,8 @@ final class TabContextRoutingTests: XCTestCase {
                     windowStateIdentity: ObjectIdentifier(window),
                     serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
                     provenance: .hiddenWindowArgument
-                )
+                ),
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -3026,7 +3048,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: runScopedConnectionID,
                 clientName: "public-start-missing-run-route",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -3049,7 +3072,8 @@ final class TabContextRoutingTests: XCTestCase {
                     tabID: activeTabID,
                     workspaceID: activeWorkspace.id,
                     windowID: window.windowID
-                )
+                ),
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -3071,7 +3095,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: missingActiveConnectionID,
                 clientName: "public-start-missing-active",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             ))
             await XCTAssertThrowsErrorAsync({
                 try await window.mcpServer.executeAgentRunForTesting(args: [
@@ -3116,7 +3141,8 @@ final class TabContextRoutingTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "cached-nested-routing-test",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             )
 
             await XCTAssertThrowsErrorAsync({

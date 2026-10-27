@@ -4480,7 +4480,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         _ = try await startRun(
             target,
             "role omp",
-            .init(connectionID: UUID(), clientName: "role-thinking-handoff-test", windowID: nil),
+            .init(connectionID: UUID(), clientName: "role-thinking-handoff-test", windowID: nil, actorRoutedRunTab: nil),
             { _, _ in },
             harness.host,
             resolvedSelection.agentRaw,
@@ -7139,6 +7139,86 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    /// The Claude runner's lease release once the turn's message is sent: a launch agent PID whose
+    /// existing route the host proves takes the early release (no routing wait); a nil launch PID
+    /// never asks the host, and a refused early release falls back to `releaseWhenRouted`.
+    func testClaudeTurnReleaseTakesTheEarlyReleaseOnlyForAProvenLaunchRoute() async throws {
+        enum Row: String, CaseIterable {
+            case provenRoute
+            case nilLaunchPID
+            case refusedRelease
+        }
+        final class LeaseBox {
+            var leases: [MCPBootstrapLease] = []
+        }
+        let launchAgentPID: pid_t = 4242
+        for row in Row.allCases {
+            let label = row.rawValue
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleFakeNativeController(recorder: recorder)
+            if row != .nilLaunchPID {
+                await controller.setRepoPromptMCPLaunchAgentPID(launchAgentPID)
+            }
+            let box = LeaseBox()
+            let releaseGranted = row == .provenRoute
+            let harness = makeHarness(
+                recorder: recorder,
+                claudeController: controller,
+                autoSignalACPRouting: true,
+                testOMPQualificationLeaseCreated: { box.leases.append($0) },
+                provenRoutePolicyReleaser: { _, pid in
+                    recorder.record("proven-release:\(pid)")
+                    return releaseGranted
+                }
+            )
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .claudeCode
+
+            _ = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "turn",
+                initialMessageForRun: "turn",
+                attachments: []
+            )
+            try await waitUntil("\(label): Claude sends") { recorder.contains("claude:send") }
+            let lease = try XCTUnwrap(box.leases.last, label)
+            // Both release paths set `hasReleased` before their awaited gate release and routing
+            // cleanup, so wait for the release to finish (its routing cleanup ran), not just begin.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            var snapshot = await lease.debugCleanupSnapshot()
+            while !(snapshot.hasReleased && snapshot.routingCleanupCount > 0) {
+                guard ContinuousClock.now < deadline else {
+                    XCTFail("\(label): the lease release never finished")
+                    break
+                }
+                try await Task.sleep(nanoseconds: 2_000_000)
+                snapshot = await lease.debugCleanupSnapshot()
+            }
+
+            let releaseRequests = recorder.events.count(where: { $0.hasPrefix("proven-release:") })
+            switch row {
+            case .provenRoute:
+                XCTAssertEqual(releaseRequests, 1, label)
+                XCTAssertTrue(recorder.contains("proven-release:\(launchAgentPID)"), label)
+                XCTAssertTrue(snapshot.didReleaseWithProvenExistingRoute, label)
+                XCTAssertFalse(snapshot.didRevokePolicy, label)
+            case .nilLaunchPID:
+                XCTAssertEqual(releaseRequests, 0, "\(label): the host is never asked")
+                XCTAssertFalse(snapshot.didReleaseWithProvenExistingRoute, label)
+                XCTAssertTrue(snapshot.didRouteSuccessfully, "\(label): releaseWhenRouted ran")
+            case .refusedRelease:
+                XCTAssertEqual(releaseRequests, 1, label)
+                XCTAssertFalse(snapshot.didReleaseWithProvenExistingRoute, label)
+                XCTAssertTrue(snapshot.didRouteSuccessfully, "\(label): releaseWhenRouted ran")
+            }
+            XCTAssertTrue(snapshot.hasReleased, label)
+            XCTAssertEqual(snapshot.routingCleanupCount, 1, label)
+
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
+        }
+    }
+
     func testCancelRunCleansClaudeAndACPProvidersAfterCommonMCPToolCancellation() async throws {
         for row in LifecycleCancellationRow.allCases {
             let recorder = LifecycleRecorder()
@@ -7461,7 +7541,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         testBeforeOMPQualificationPromptStartClaim: @escaping () async -> Void = {},
         testBeforeOMPQualificationGenericStartupFailureTeardown: @escaping () async -> Void = {},
         testOMPQualificationToolTrackingStopped: @escaping (UUID) -> Void = { _ in },
-        testOMPQualificationLeaseCreated: @escaping (MCPBootstrapLease) -> Void = { _ in }
+        testOMPQualificationLeaseCreated: @escaping (MCPBootstrapLease) -> Void = { _ in },
+        provenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)? = nil
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -7507,7 +7588,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             testCodexAuthRecovery: codexAuthRecovery
         )
         lifecycleHosts.append(host)
-        let dependencies = AgentModeRunService.Dependencies(
+        var dependencies = AgentModeRunService.Dependencies(
             windowID: 1,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
@@ -7551,6 +7632,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ),
             testOMPQualificationLeaseCreated: testOMPQualificationLeaseCreated
         )
+        dependencies.testProvenRoutePolicyReleaser = provenRoutePolicyReleaser
         return LifecycleHarness(
             service: AgentModeRunService(
                 dependencies: dependencies,

@@ -592,6 +592,38 @@ package final actor ClaudeNativeProcessSessionController {
         get async { repoPromptMCPHealth }
     }
 
+    /// The spawned process's PID bound to the current launch token (`currentLaunchAgentPID`) while
+    /// the launch is initialized, healthy and not shutting down. It may not be registered as the
+    /// run's expected agent yet. `async` to match `NativeAgentRuntimeControlling` exactly (see
+    /// `currentRepoPromptMCPHealth`).
+    package var repoPromptMCPLaunchAgentPID: pid_t? {
+        get async {
+            guard process != nil, isInitialized, !isShuttingDown,
+                  !repoPromptMCPHealth.isUnhealthy
+            else { return nil }
+            return currentLaunchAgentPID
+        }
+    }
+
+    /// The agent PID bound to the current launch token: the spawned process's PID installed
+    /// together with `repoPromptMCPLaunchToken` (`installSpawnLaunchTokens`), while that token is
+    /// still the current one and that process is still attached. Independent of the loss-observer
+    /// registration. `registeredExpectedAgentPID` is not reset at a spawn (only at shutdown or a
+    /// failed registration), so right after a respawn it still names the previous process until
+    /// the new registration; this never does. The manager still fails closed for this PID until
+    /// it is registered with a readable identity.
+    private var currentLaunchAgentPID: pid_t? {
+        guard let token = repoPromptMCPLaunchToken,
+              let launch = spawnedLaunchAgent,
+              launch.token == token,
+              process?.pid == launch.pid
+        else { return nil }
+        return launch.pid
+    }
+
+    /// The spawned process's PID, installed with its launch token in one synchronous step.
+    private var spawnedLaunchAgent: (token: UUID, pid: pid_t)?
+
     /// Connection IDs whose loss this launch already applied (duplicate deliveries are ignored).
     private var repoPromptMCPLostConnectionIDs: Set<UUID> = []
     private var runConnectionLossObserverToken: UUID?
@@ -1200,6 +1232,7 @@ package final actor ClaudeNativeProcessSessionController {
         await unregisterRunConnectionLossObserverIfNeeded()
         resetRepoPromptMCPHealthForLaunch()
         repoPromptMCPLaunchToken = nil
+        spawnedLaunchAgent = nil
         process = nil
         configuredContextWindow = nil
         promptCacheRetention = .standard
@@ -1441,7 +1474,7 @@ package final actor ClaudeNativeProcessSessionController {
         latestRuntimeInitMcpServerStatuses = [:]
         lastEmittedRuntimeInitStatus = nil
         resetRepoPromptMCPHealthForLaunch()
-        installSpawnLaunchTokens(launchToken)
+        installSpawnLaunchTokens(launchToken, agentPID: spawned.pid)
         process = spawned
         runtimeLaunch = launch
         runtimeManagedTransport = launch != nil
@@ -2900,9 +2933,10 @@ package final actor ClaudeNativeProcessSessionController {
     /// The single place a spawn installs its launch token: the stdout reader generation and the
     /// RepoPrompt MCP loss gate always share it, so `handleStdoutEOF`'s retirement (keyed on the
     /// stdout token) is compared with the same value in `noteRepoPromptMCPConnectionLost`.
-    private func installSpawnLaunchTokens(_ launchToken: UUID) {
+    private func installSpawnLaunchTokens(_ launchToken: UUID, agentPID: pid_t) {
         repoPromptMCPLaunchToken = launchToken
         activeStdoutLaunchToken = launchToken
+        spawnedLaunchAgent = (launchToken, agentPID)
     }
 
     /// Retires the current stdout reader generation. `handleStdoutEOF` does this before its
@@ -3024,8 +3058,18 @@ package final actor ClaudeNativeProcessSessionController {
                 return .connected
             }
             if useAppRoute {
-                let hasRoute: Bool = if let clientName = config.runtimeVariant.agentKind.mcpClientNameHint {
-                    await mcpHost.hasAuthoritativeLiveRunRoute(runID: runID, expectedClientName: clientName)
+                let hasRoute: Bool = if let clientName = config.runtimeVariant.agentKind.mcpClientNameHint,
+                                        let agentPID = currentLaunchAgentPID
+                {
+                    // The run's route must belong to this launch's own agent instance (the PID it
+                    // registered, at the start time read then): a helper route retained across
+                    // turns from an earlier launch never certifies a restart. The launch-token
+                    // checks before and after this call bracket it.
+                    await mcpHost.hasAuthoritativeLiveRunRoute(
+                        runID: runID,
+                        expectedClientName: clientName,
+                        requiredAgentPID: agentPID
+                    )
                 } else {
                     false
                 }
@@ -3475,7 +3519,7 @@ package final actor ClaudeNativeProcessSessionController {
             // As at a production spawn: a new launch starts with fresh health and a new token.
             resetRepoPromptMCPHealthForLaunch()
             process = spawned
-            installSpawnLaunchTokens(UUID())
+            installSpawnLaunchTokens(UUID(), agentPID: spawned.pid)
             if initialized {
                 completeInitialization()
             } else {
@@ -4546,11 +4590,31 @@ package final actor ClaudeNativeProcessSessionController {
         else {
             return
         }
+        let previousPID = registeredExpectedAgentPID.flatMap { $0 == pid ? nil : $0 }
         registeredExpectedAgentPID = pid
+        #if DEBUG
+            // Both launch paths (runtime-managed or not) register the spawned process installed
+            // with the current launch token; a different PID means the early-release proof would
+            // ask about a process the host never registered for this launch.
+            if let token = repoPromptMCPLaunchToken,
+               let launch = spawnedLaunchAgent,
+               launch.token == token,
+               launch.pid != pid
+            {
+                print("[ClaudeNativeSession] DEBUG expected-PID mismatch: registering pid=\(pid) but launch token=\(token.uuidString) spawned pid=\(launch.pid) runID=\(runID.uuidString)")
+            }
+        #endif
         // The loss observer registers first, in the first manager call after spawn: this launch's
         // helper only connects once Claude has booted and started it, so its connection is not
         // recorded as predating this launch's observer (no extra hop for it to slip into).
         await registerRunConnectionLossObserverIfNeeded(expectedAgentPID: pid)
+        // A same-controller respawn (after an unexpected stdout EOF, which never clears it) still
+        // has the previous process's PID registered. Clear it first, after the previous launch's
+        // loss observer was replaced above: the clear releases that instance, unrouting its
+        // dependents, and closes the window in which a reused PID passes the PID-only admission gate.
+        if let previousPID {
+            await mcpHost.clearExpectedAgentPID(previousPID, for: clientName, runID: runID)
+        }
         await mcpHost.registerExpectedAgentPID(
             pid,
             for: clientName,

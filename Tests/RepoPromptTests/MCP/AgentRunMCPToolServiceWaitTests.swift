@@ -150,7 +150,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                         metadata: .init(
                             connectionID: UUID(),
                             clientName: "generic-start-cleanup-test",
-                            windowID: window.windowID
+                            windowID: window.windowID,
+                            actorRoutedRunTab: nil
                         ),
                         bindCurrentRequestToTab: { _, _ in },
                         agentModeVM: viewModel,
@@ -263,7 +264,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                         metadata: .init(
                             connectionID: connectionID,
                             clientName: "omp-post-activation-replacement-test",
-                            windowID: window.windowID
+                            windowID: window.windowID,
+                            actorRoutedRunTab: nil
                         ),
                         bindCurrentRequestToTab: { _, _ in
                             activatedControlContext = session.mcpControlContext
@@ -2336,7 +2338,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                     MCPServerViewModel.RequestMetadata(
                         connectionID: connectionID,
                         clientName: AgentProviderKind.ohMyPiMCPClientID,
-                        windowID: window.windowID
+                        windowID: window.windowID,
+                        actorRoutedRunTab: nil
                     )
                 },
                 requireTargetWindow: { window },
@@ -3465,7 +3468,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             metadata: MCPServerViewModel.RequestMetadata(
                 connectionID: nil,
                 clientName: "agent-run-wait-tests",
-                windowID: window.windowID
+                windowID: window.windowID,
+                actorRoutedRunTab: nil
             ),
             parentFamily: .codex,
             parentPromptCacheRetention: .standard
@@ -3803,7 +3807,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: connectionID,
                     clientName: "agent-run-wait-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

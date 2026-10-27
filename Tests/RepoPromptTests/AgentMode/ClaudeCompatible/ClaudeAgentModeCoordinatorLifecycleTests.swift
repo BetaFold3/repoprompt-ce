@@ -2745,6 +2745,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var repoPromptMCPHealthGate: LifecycleAsyncGate?
     private var repoPromptMCPHealthReadCount = 0
     private var repoPromptMCPProbeCount = 0
+    private var repoPromptMCPLaunchAgentPIDValue: pid_t?
 
     init(
         recorder: LifecycleRecorder,
@@ -3156,5 +3157,15 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 
     func recordedRepoPromptMCPHealthReadCount() -> Int {
         repoPromptMCPHealthReadCount
+    }
+
+    /// The agent PID of the launch whose helper serves this session (nil by default, like a
+    /// controller without a launch identity).
+    var repoPromptMCPLaunchAgentPID: pid_t? {
+        repoPromptMCPLaunchAgentPIDValue
+    }
+
+    func setRepoPromptMCPLaunchAgentPID(_ pid: pid_t?) {
+        repoPromptMCPLaunchAgentPIDValue = pid
     }
 }

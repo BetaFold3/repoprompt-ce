@@ -257,7 +257,8 @@ final class AgentRunWaitDrainTestHarness {
         MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "agent-run-wait-drain-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
     }
 
@@ -328,7 +329,8 @@ final class AgentRunWaitDrainTestHarness {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: connectionID,
                     clientName: "agent-run-wait-drain-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

@@ -20,9 +20,10 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         private var received = Data()
         let process: SpawnedProcess
 
-        init() {
+        /// `pid` is a placeholder no process has; no signal is ever sent to it.
+        init(pid: pid_t = pid_t.max) {
             process = SpawnedProcess(
-                pid: pid_t.max,
+                pid: pid,
                 processGroupID: nil,
                 stdin: stdinPipe.fileHandleForWriting,
                 stdinDescriptor: stdinPipe.fileHandleForWriting.fileDescriptor,
@@ -63,24 +64,48 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
     private actor GatedRouteMCPHost: AgentMCPHosting {
         private var routeIsLive: Bool
         private var routeGate: LifecycleAsyncGate?
+        /// As the manager does: a lookup for a PID never registered as an expected agent fails closed.
+        private let answersOnlyForRegisteredPIDs: Bool
+        private var registeredPIDs: Set<pid_t> = []
         private(set) var routeLookupCount = 0
+        private(set) var routeLookupRequiredAgentPIDs: [pid_t?] = []
         private(set) var calls: [String] = []
 
-        init(routeIsLive: Bool, routeGate: LifecycleAsyncGate? = nil) {
+        init(routeIsLive: Bool, routeGate: LifecycleAsyncGate? = nil, answersOnlyForRegisteredPIDs: Bool = false) {
             self.routeIsLive = routeIsLive
             self.routeGate = routeGate
+            self.answersOnlyForRegisteredPIDs = answersOnlyForRegisteredPIDs
         }
 
         func isRunning() -> Bool {
             true
         }
 
-        func hasAuthoritativeLiveRunRoute(runID _: UUID, expectedClientName _: String) async -> Bool {
+        func hasAuthoritativeLiveRunRoute(
+            runID _: UUID,
+            expectedClientName _: String,
+            requiredAgentPID: pid_t?
+        ) async -> Bool {
             routeLookupCount += 1
+            routeLookupRequiredAgentPIDs.append(requiredAgentPID)
             if let routeGate {
                 await routeGate.arriveAndWait()
             }
+            if answersOnlyForRegisteredPIDs {
+                return routeIsLive && requiredAgentPID.map { registeredPIDs.contains($0) } == true
+            }
             return routeIsLive
+        }
+
+        func refreshRetainedRunPolicyForTurnStart(for _: String, runID _: UUID) {}
+
+        func releasePendingRunPolicyForProvenRoute(
+            for _: String,
+            windowID _: Int,
+            runID _: UUID,
+            agentPID _: pid_t
+        ) -> Bool {
+            false
         }
 
         func waitForNewConnection(clientName _: String?, timeout _: TimeInterval) -> UUID? {
@@ -88,16 +113,24 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         }
 
         func registerExpectedAgentPID(
-            _: pid_t,
+            _ pid: pid_t,
             for _: String,
             runID _: UUID?,
             expectedProcessExecutablePath _: String?,
             expectedProcessExecutableIdentity _: ExecutableFileIdentity?
         ) {
             calls.append("registerExpectedAgentPID")
+            registeredPIDs.insert(pid)
         }
 
-        func clearExpectedAgentPID(_: pid_t, for _: String, runID _: UUID?) {}
+        func clearExpectedAgentPID(_ pid: pid_t, for _: String, runID _: UUID?) {
+            calls.append("clearExpectedAgentPID:\(pid)")
+            registeredPIDs.remove(pid)
+        }
+
+        var registeredExpectedAgentPIDs: Set<pid_t> {
+            registeredPIDs
+        }
 
         func requireExpectedAgentPIDForPendingPolicy(for _: String, runID _: UUID, windowID _: Int?) -> Bool {
             true
@@ -126,6 +159,8 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
 
         func revokeClientConnectionPolicy(for _: String, windowID _: Int, runID _: UUID) {}
 
+        func cleanupRunRoutingIfUnproven(for _: String, windowID _: Int, runID _: UUID) {}
+
         func registerToolEventObserver(
             for _: UUID,
             onCalled _: @escaping @Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) async -> Void,
@@ -148,7 +183,9 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
             return UUID()
         }
 
-        func unregisterRunConnectionLossObserver(for _: UUID, token _: UUID) {}
+        func unregisterRunConnectionLossObserver(for _: UUID, token _: UUID) {
+            calls.append("unregisterRunConnectionLossObserver")
+        }
 
         #if DEBUG
             func debugRecordRunRoutingEvent(runID _: UUID, event _: String, connectionID _: UUID?, fields _: [String: String]) {}
@@ -604,12 +641,19 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         XCTAssertEqual(connectedThroughAdapter, .connected)
         let evidence = await adapter.awaitRepoPromptMCPConnectedEvidence(timeoutSeconds: 1, pollIntervalSeconds: 0.01)
         XCTAssertEqual(evidence, .connected)
+        // The launch PID gates the later-turn early release; the adapter must forward it.
+        let launchPIDThroughController = await controller.repoPromptMCPLaunchAgentPID
+        let launchPIDThroughAdapter = await adapter.repoPromptMCPLaunchAgentPID
+        XCTAssertNotNil(launchPIDThroughController)
+        XCTAssertEqual(launchPIDThroughAdapter, launchPIDThroughController)
 
         await controller.noteRepoPromptMCPConnectionLost(loss(for: launch))
         let unhealthyThroughAdapter = await adapter.currentRepoPromptMCPHealth
         XCTAssertEqual(unhealthyThroughAdapter, .unhealthy(reason: "tool_execution_watchdog"))
         let refusedEvidence = await adapter.awaitRepoPromptMCPConnectedEvidence(timeoutSeconds: 1, pollIntervalSeconds: 0.01)
         XCTAssertEqual(refusedEvidence, .notConnected("tool_execution_watchdog"))
+        let unhealthyLaunchPIDThroughAdapter = await adapter.repoPromptMCPLaunchAgentPID
+        XCTAssertNil(unhealthyLaunchPIDThroughAdapter)
         XCTAssertTrue(transport.mcpStatusRequestIDs.isEmpty)
     }
 
@@ -688,6 +732,9 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         let controller = try makeController(mcpHost: host)
         let first = FixtureTransport()
         await controller.test_attachSpawnedProcess(first.process)
+        // The app-route fallback binds to the launch's registered agent PID; without one it makes
+        // no lookup at all (`testAppRouteFallbackWithoutARegisteredAgentPIDIsNeverConnected`).
+        await controller.test_registerExpectedAgentPID(first.process.pid)
         defer { Task { await controller.test_detachFixtureTransport() } }
 
         let probe = Task {
@@ -755,6 +802,7 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         let controller = try makeController(mcpHost: host)
         let transport = FixtureTransport()
         await controller.test_attachSpawnedProcess(transport.process)
+        await controller.test_registerExpectedAgentPID(transport.process.pid)
         defer { Task { await controller.test_detachFixtureTransport() } }
 
         // Under a second left: the single `mcp_status` request times out after 0.5 s.
@@ -764,8 +812,87 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
         XCTAssertEqual(transport.mcpStatusRequestIDs.count, 1, "an unanswered mcp_status is not retried")
         let lookups = await host.routeLookupCount
         XCTAssertEqual(lookups, 1)
+        let requiredAgentPIDs = await host.routeLookupRequiredAgentPIDs
+        XCTAssertEqual(
+            requiredAgentPIDs, [transport.process.pid],
+            "the Claude fallback binds the route to this launch's own registered agent PID"
+        )
         let health = await controller.currentRepoPromptMCPHealth
         XCTAssertEqual(health, .connected)
+    }
+
+    /// Right after a respawn, before the new launch registers, the launch agent PID (used by the
+    /// early release) and the probe's app-route fallback name the spawned process installed with
+    /// the current launch token: never the previous process, and independent of the loss-observer
+    /// registration. The manager fails closed for that PID until it is registered, so the probe
+    /// stays not connected until then.
+    func testLaunchAgentPIDAfterARespawnIsNeverThePreviousProcess() async throws {
+        let host = GatedRouteMCPHost(routeIsLive: true, answersOnlyForRegisteredPIDs: true)
+        let controller = try makeController(mcpHost: host)
+        let first = FixtureTransport(pid: pid_t.max)
+        await controller.test_attachSpawnedProcess(first.process)
+        await controller.test_registerExpectedAgentPID(first.process.pid)
+        defer { Task { await controller.test_detachFixtureTransport() } }
+        let firstPID = await controller.repoPromptMCPLaunchAgentPID
+        XCTAssertEqual(firstPID, first.process.pid)
+
+        let successor = FixtureTransport(pid: pid_t.max - 1)
+        await controller.test_attachSpawnedProcess(successor.process)
+
+        let beforeRegistration = await controller.repoPromptMCPLaunchAgentPID
+        XCTAssertEqual(beforeRegistration, successor.process.pid, "the spawned process, never the previous one")
+        let observerLaunch = await controller.test_currentRunConnectionLossObserverLaunch()
+        XCTAssertNotEqual(observerLaunch?.agentProcessID, successor.process.pid, "fixture: the new launch's observer is not registered yet")
+        // The probe's app-route fallback binds the lookup to the spawned process; the manager
+        // fails closed for an unregistered PID.
+        let probe = Task {
+            await controller.awaitRepoPromptMCPConnectedEvidence(timeoutSeconds: 0.3, pollIntervalSeconds: 0.01)
+        }
+        let requests = try await waitForMCPStatusRequests(successor, count: 1)
+        try await respond(controller, requestID: requests[0], subtype: "error", error: "Unsupported control request")
+        let outcome = await probe.value
+        guard case let .notConnected(reason) = outcome else {
+            return XCTFail("Expected not connected, got \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("no live run route"), reason)
+        let lookupPIDs = await host.routeLookupRequiredAgentPIDs
+        XCTAssertFalse(lookupPIDs.isEmpty, "the fallback looked the route up")
+        XCTAssertTrue(lookupPIDs.allSatisfy { $0 == successor.process.pid }, "only the spawned process's PID: \(lookupPIDs)")
+        XCTAssertFalse(lookupPIDs.contains(first.process.pid), "the previous process's PID is never looked up")
+
+        await controller.test_registerExpectedAgentPID(successor.process.pid)
+        let afterRegistration = await controller.repoPromptMCPLaunchAgentPID
+        XCTAssertEqual(afterRegistration, successor.process.pid)
+    }
+
+    /// Before the launch registers its agent PID, the fallback never asks for a
+    /// launch-independent route: every lookup binds the spawned process's PID, which the manager
+    /// fails closed for until it is registered, so the probe stays not connected.
+    func testAppRouteFallbackWithoutARegisteredAgentPIDIsNeverConnected() async throws {
+        let host = GatedRouteMCPHost(routeIsLive: true, answersOnlyForRegisteredPIDs: true)
+        let controller = try makeController(mcpHost: host)
+        let transport = FixtureTransport()
+        await controller.test_attachSpawnedProcess(transport.process)
+        defer { Task { await controller.test_detachFixtureTransport() } }
+
+        let probe = Task {
+            await controller.awaitRepoPromptMCPConnectedEvidence(timeoutSeconds: 0.9, pollIntervalSeconds: 0.01)
+        }
+        let requests = try await waitForMCPStatusRequests(transport, count: 1)
+        try await respond(controller, requestID: requests[0], subtype: "error", error: "Unsupported control request")
+        let outcome = await probe.value
+
+        guard case .notConnected = outcome else {
+            return XCTFail("Expected not connected, got \(outcome)")
+        }
+        let lookupPIDs = await host.routeLookupRequiredAgentPIDs
+        XCTAssertFalse(lookupPIDs.isEmpty, "fixture: the app-route fallback ran")
+        XCTAssertTrue(
+            lookupPIDs.allSatisfy { $0 == transport.process.pid },
+            "no launch-independent lookup; only the spawned process's PID: \(lookupPIDs)"
+        )
+        let health = await controller.currentRepoPromptMCPHealth
+        XCTAssertNotEqual(health, .connected)
     }
 
     /// RepoPrompt not yet listed in `mcp_status` is treated like `pending`: the probe keeps
@@ -870,6 +997,39 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
 
         let calls = await host.calls
         XCTAssertEqual(calls, ["registerRunConnectionLossObserver", "registerExpectedAgentPID"])
+    }
+
+    /// A same-controller respawn (an unexpected stdout EOF never clears the previous PID): the next
+    /// registration moves the loss observer to the new launch, then clears the previous process's
+    /// expected PID, then registers the new one, so no stale PID stays registered for the run.
+    func testASameControllerRespawnClearsThePreviousExpectedAgentPIDBeforeRegisteringTheNewOne() async throws {
+        let host = GatedRouteMCPHost(routeIsLive: false)
+        let controller = try makeController(mcpHost: host)
+        let first = FixtureTransport(pid: pid_t.max)
+        await controller.test_attachSpawnedProcess(first.process)
+        await controller.test_registerExpectedAgentPID(first.process.pid)
+        defer { Task { await controller.test_detachFixtureTransport() } }
+        let successor = FixtureTransport(pid: pid_t.max - 1)
+        await controller.test_attachSpawnedProcess(successor.process)
+
+        await controller.test_registerExpectedAgentPID(successor.process.pid)
+
+        let calls = await host.calls
+        XCTAssertEqual(calls, [
+            "registerRunConnectionLossObserver",
+            "registerExpectedAgentPID",
+            "unregisterRunConnectionLossObserver",
+            "registerRunConnectionLossObserver",
+            "clearExpectedAgentPID:\(first.process.pid)",
+            "registerExpectedAgentPID"
+        ])
+        let registered = await host.registeredExpectedAgentPIDs
+        XCTAssertEqual(registered, [successor.process.pid], "only the new launch's PID stays registered")
+
+        // Re-registering the same PID clears nothing.
+        await controller.test_registerExpectedAgentPID(successor.process.pid)
+        let repeated = await host.calls
+        XCTAssertFalse(repeated.dropFirst(calls.count).contains { $0.hasPrefix("clearExpectedAgentPID") })
     }
 
     func testUnhealthyLaunchNeverProducesConnectedEvidence() async throws {

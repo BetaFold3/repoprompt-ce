@@ -46,6 +46,8 @@ package final class AgentModeRunService {
             var testOMPQualificationProviderBootstrapEntry: () -> Void = {}
             var ompQualificationStartupProbes = ACPIntegratedAgentModeRunner.OMPQualificationStartupProbes()
             var testOMPQualificationLeaseCreated: (MCPBootstrapLease) -> Void = { _ in }
+            /// Replaces the lease's proven-route policy releaser (runner-level early-release tests).
+            var testProvenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)?
         #endif
 
         #if DEBUG
@@ -763,12 +765,18 @@ package final class AgentModeRunService {
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
                 additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
             )
+            #if DEBUG
+                let provenRoutePolicyReleaser = self.dependencies.testProvenRoutePolicyReleaser
+            #else
+                let provenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)? = nil
+            #endif
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
                 runCoordinator: runCoordinator,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
-                expectedPIDPolicyArmer: expectedPIDPolicyArmer
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer,
+                provenRoutePolicyReleaser: provenRoutePolicyReleaser
             )
             #if DEBUG
                 self.dependencies.testOMPQualificationLeaseCreated(lease)

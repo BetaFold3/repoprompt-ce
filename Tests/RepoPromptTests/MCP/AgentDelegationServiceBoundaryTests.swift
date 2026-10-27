@@ -1604,7 +1604,8 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
             connectionID: nil,
             clientName: "agent-delegation-boundary-tests",
             windowID: window.windowID,
-            toolInvocationID: toolInvocationID
+            toolInvocationID: toolInvocationID,
+            actorRoutedRunTab: nil
         )
     }
 

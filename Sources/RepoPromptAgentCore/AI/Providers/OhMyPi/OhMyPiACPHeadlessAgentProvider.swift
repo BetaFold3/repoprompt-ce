@@ -43,7 +43,8 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
                 verifyLiveRoute: { runID in
                     await mcpHost.hasAuthoritativeLiveRunRoute(
                         runID: runID,
-                        expectedClientName: AgentProviderKind.ohMyPiMCPClientID
+                        expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+                        requiredAgentPID: nil
                     )
                 }
             )

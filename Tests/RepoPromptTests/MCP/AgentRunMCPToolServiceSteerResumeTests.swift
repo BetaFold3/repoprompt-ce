@@ -397,7 +397,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: UUID(),
                     clientName: "agent-run-steer-resume-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

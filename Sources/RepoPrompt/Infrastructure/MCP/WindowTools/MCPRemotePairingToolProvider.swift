@@ -130,10 +130,13 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         static func liveGatewayDependencies() -> ExecutionDependencies {
             ExecutionDependencies(
                 captureRequestMetadata: {
+                    // The gateway principal connection is never run-routed (policy hydration and
+                    // routing fallback skip it), so it has no actor-side run tab.
                     MCPServerViewModel.RequestMetadata(
                         connectionID: ServerNetworkManager.currentConnectionID,
                         clientName: nil,
-                        windowID: nil
+                        windowID: nil,
+                        actorRoutedRunTab: nil
                     )
                 },
                 isGatewayPrincipalConnection: { connectionID in

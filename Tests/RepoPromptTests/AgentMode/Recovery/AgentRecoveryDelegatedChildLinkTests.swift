@@ -42,7 +42,7 @@ final class AgentRecoveryDelegatedChildLinkTests: XCTestCase {
             XCTAssertEqual(nested, expected, "A nested scope without an ID keeps the inherited one")
         }
         XCTAssertNil(ServerNetworkManager.currentToolInvocationID, "Nothing outside a dispatched call")
-        let metadata = MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil)
+        let metadata = MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil, actorRoutedRunTab: nil)
         XCTAssertNil(metadata.toolInvocationID, "Existing metadata construction is unchanged")
     }
 
@@ -597,7 +597,7 @@ final class AgentRecoveryDelegatedChildLinkTests: XCTestCase {
         try await AgentExternalMCPRunStarter.start(
             target: AgentModeViewModel.MCPSessionTarget(tabID: child.session.tabID, sessionID: child.sessionID, origin: .createdNewTab),
             message: "Delegated work",
-            metadata: MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil),
+            metadata: MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil, actorRoutedRunTab: nil),
             bindCurrentRequestToTab: { _, _ in
                 if cancelAtBind {
                     withUnsafeCurrentTask { $0?.cancel() }

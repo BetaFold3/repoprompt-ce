@@ -31,6 +31,19 @@ Scenarios (each uses its own fresh Agent session, cleaned up at the end):
   soft-disconnect  DEBUG ``soft_disconnect_connection`` (no kill). Expect the helper
                    to reconnect, no loss, and no Claude restart.
   baseline         Two plain turns. Expect no loss and no Claude restart.
+  laterturn-kill   Turn 1 and turn 2 on the same Claude process; turn 2 must reuse
+                   the turn-1 helper (same connection, PID and start), else FAIL as
+                   not exercising retention. Wait until at least 15 s after turn 2
+                   was submitted (past that turn's 10 s routing wait), require the
+                   helper still run-routed (``route_preserved``) and, from the
+                   required ``run_routing_history``, that turn 2's lease kept the
+                   route; record its path as its own check, which requires the early
+                   release (``route_wait_skipped_proven_route`` and
+                   ``policy_released_for_proven_route``) and FAILs a revoke with
+                   ``routing_preserved=true`` (the 10 s wait path) unless a prune
+                   after the run's last route assignment (``policy_applied`` or
+                   ``live_affinity_route_restored``) recorded ``window_mapping_removed=true``; SIGKILL it, require the helper-exit notice,
+                   then turn 3. Expect helper_exited, Claude restart.
 
 Evidence per scenario: the transcript error via ``agent_manage get_log``; the
 Claude PID before/after and its ``--resume``/``--session-id`` conversation ID; the
@@ -73,12 +86,13 @@ import omp_qualification_support as support  # noqa: E402 - after the script-dir
 
 
 DIAGNOSTICS_TOOL = "__repoprompt_debug_diagnostics"
-SCENARIOS = ("idle-kill", "midturn-kill", "watchdog", "soft-disconnect", "baseline")
+SCENARIOS = ("idle-kill", "midturn-kill", "watchdog", "soft-disconnect", "baseline", "laterturn-kill")
 DISCONNECT_MARKER = "RepoPrompt MCP disconnected from Claude"
 REASON_MARKERS = {
     "idle-kill": "the RepoPrompt MCP helper process exited",
     "midturn-kill": "the RepoPrompt MCP helper process exited",
     "watchdog": "did not stop after its deadline",
+    "laterturn-kill": "the RepoPrompt MCP helper process exited",
 }
 # The tool every turn calls; transcript tool names may carry an MCP server prefix.
 PROBE_TOOL = "get_file_tree"
@@ -91,6 +105,12 @@ MAXCOMLEN = 16
 # poller resolves them. Leave headroom before steering.
 HELPER_EXIT_SETTLE_SECONDS = 6.0
 ROUTE_RESTORE_SETTLE_SECONDS = 25.0
+# A later turn's bootstrap lease either releases at once for the launch's proven route or
+# waits 10 s for a new helper connection before it revokes its unused routing policy; the
+# retained route is checked after that window, with headroom.
+LATERTURN_ROUTE_CHECK_SECONDS = 15.0
+# How long the transcript may take to show the helper-exit notice after the settle.
+LOSS_NOTICE_TIMEOUT_SECONDS = 20.0
 MAX_ANCESTRY_DEPTH = 16
 
 
@@ -340,6 +360,246 @@ def select_run_helpers(
             continue
         candidates.append(helper)
     return candidates
+
+
+def preserved_route_helper(
+    rows: Iterable[dict[str, Any]],
+    connection_id: str,
+    run_ids: set[str],
+) -> tuple[HelperIdentity | None, str]:
+    """The helper of connection `connection_id` (canonical key) when its row is still routed
+    to one of `run_ids` (canonical keys), else None; plus a detail for the check table."""
+    for candidate in rows:
+        if uuid_key(candidate.get("id")) != connection_id:
+            continue
+        mapped = uuid_key(candidate.get("run_id"))
+        if mapped is None or mapped not in run_ids:
+            return None, f"connection {connection_id} has run_id {candidate.get('run_id')!r}, expected one of {sorted(run_ids)}"
+        helper = helper_from_row(candidate)
+        if helper is None:
+            return None, f"connection {connection_id} row carries no helper identity"
+        return helper, f"connection {connection_id} run_id={mapped} helper_pid={helper.pid}"
+    return None, f"connection {connection_id} is no longer listed"
+
+
+def same_helper_instance(first: HelperIdentity, second: HelperIdentity) -> bool:
+    """Whether two observations are the same helper connection and process instance."""
+    return first.connection_id == second.connection_id and first.pid == second.pid and first.start == second.start
+
+
+# Routing-history events of a later turn's lease that kept the run's route without revoking.
+RETENTION_EARLY_RELEASE_EVENTS = ("route_wait_skipped_proven_route", "policy_released_for_proven_route")
+
+
+class RoutingHistoryUnsupported(LiveAcceptanceError):
+    """The app does not support `run_routing_history` (a non-DEBUG build, or an app without the op)."""
+
+
+# What the CLI or the diagnostics tool reports for an op or tool the app does not have.
+UNSUPPORTED_DIAGNOSTICS_MARKERS = ("unknown_op", "Unknown debug diagnostics op", "Unknown tool", "unknown tool")
+
+
+def diagnostics_raw_call(
+    cli: Path, window_id: int, payload: dict[str, Any], timeout: float = 30
+) -> tuple[int, bytes, bytes]:
+    """One diagnostics CLI call, unnormalized: (exit code, stdout, stderr)."""
+    command = [str(cli), "--raw-json", "-w", str(window_id), "-c", DIAGNOSTICS_TOOL, "-j", json.dumps(payload, separators=(",", ":"))]
+    return support._bounded_process(command, timeout, support.MAX_COMMAND_OUTPUT)
+
+
+def reports_unsupported_diagnostics(value: object) -> bool:
+    """Whether a CLI response (raw JSON or text) reports an unknown diagnostics op or tool."""
+    if isinstance(value, dict):
+        if value.get("code") == "unknown_op":
+            return True
+        return any(reports_unsupported_diagnostics(item) for item in value.values())
+    if isinstance(value, list):
+        return any(reports_unsupported_diagnostics(item) for item in value)
+    if isinstance(value, str):
+        return any(marker in value for marker in UNSUPPORTED_DIAGNOSTICS_MARKERS)
+    return False
+
+
+def routing_history(cli: Path, window_id: int, run_ids: set[str]) -> tuple[list[dict[str, Any]], int]:
+    """The recorded routing events of `run_ids` plus the app-wide latest event sequence.
+
+    Raises `RoutingHistoryUnsupported` when the app does not support the op (a non-DEBUG
+    build, or an app without it) and `LiveAcceptanceError` when a supported call failed or
+    returned a malformed payload; the two are never conflated."""
+    events: list[dict[str, Any]] = []
+    latest_seq = 0
+    for run_id in sorted(run_ids):
+        # The app's DEBUG diagnostics op accepts `limit` in 1...500 (its maximum).
+        request = {"op": "run_routing_history", "run_id": run_id, "limit": 500}
+        returncode, stdout, stderr = diagnostics_raw_call(cli, window_id, request)
+        stdout_text = stdout.decode(errors="replace")
+        stderr_text = stderr.decode(errors="replace")
+        if returncode != 0:
+            excerpt = (stderr_text or stdout_text)[:512]
+            if reports_unsupported_diagnostics(stdout_text) or reports_unsupported_diagnostics(stderr_text):
+                raise RoutingHistoryUnsupported(f"run_routing_history unsupported (exit {returncode}): {excerpt}")
+            raise LiveAcceptanceError(f"run_routing_history failed (exit {returncode}): {excerpt}")
+        try:
+            raw = support._strict_json_loads(stdout)
+        except support.SupportError as error:
+            raise LiveAcceptanceError(f"run_routing_history failed: {error}") from error
+        try:
+            payload = support._normalized_response(raw, "diagnostic:run_routing_history")
+        except support.SupportError as error:
+            if reports_unsupported_diagnostics(raw):
+                raise RoutingHistoryUnsupported(f"run_routing_history unsupported: {error}") from error
+            raise LiveAcceptanceError(f"run_routing_history failed: {error}") from error
+        rows = payload.get("events")
+        latest = payload.get("latest_seq")
+        if not isinstance(rows, list) or type(latest) is not int:
+            raise LiveAcceptanceError("run_routing_history failed: malformed payload (events or latest_seq)")
+        events.extend(row for row in rows if isinstance(row, dict))
+        latest_seq = max(latest_seq, latest)
+    return events, latest_seq
+
+
+def required_routing_history(
+    result: "ScenarioResult", cli: Path, window_id: int, run_ids: set[str], check_name: str, context: str
+) -> tuple[list[dict[str, Any]], int]:
+    """`routing_history`, required: an unsupported op or a failed lookup records a failed
+    `check_name` with a clear reason and stops the scenario (nothing is killed)."""
+    try:
+        return routing_history(cli, window_id, run_ids)
+    except RoutingHistoryUnsupported as error:
+        reason = f"{context}: run routing history is unsupported by this app (it needs a DEBUG CE build): {error}"
+    except LiveAcceptanceError as error:
+        reason = f"{context}: run routing history lookup failed: {error}"
+    result.check(check_name, False, reason)
+    raise LiveAcceptanceError(f"{reason}; nothing killed")
+
+
+def retention_routing_verdict(events: Iterable[dict[str, Any]], after_seq: int) -> tuple[bool | None, str]:
+    """Judge a later turn's lease from routing events recorded after `after_seq`.
+
+    True when the lease released early for the launch's proven route, or revoked with
+    `routing_preserved=true`. False when any revocation cleared routing
+    (`routing_preserved=false`) or carries no `routing_preserved` field at all (the old
+    unconditional cleanup). None when no lease outcome was recorded."""
+    kept: list[str] = []
+    cleared: list[str] = []
+    for event in events:
+        seq = event.get("seq")
+        if type(seq) is not int or seq <= after_seq:
+            continue
+        name = event.get("event")
+        if name in RETENTION_EARLY_RELEASE_EVENTS:
+            kept.append(f"{name}#{seq}")
+        elif name == "policy_revoked":
+            fields = event.get("fields")
+            preserved = fields.get("routing_preserved") if isinstance(fields, dict) else None
+            if preserved == "true":
+                kept.append(f"policy_revoked(routing_preserved=true)#{seq}")
+            else:
+                cleared.append(f"policy_revoked(routing_preserved={preserved!r})#{seq}")
+    if cleared:
+        return False, "routing cleared: " + ", ".join(cleared + kept)
+    if kept:
+        return True, ", ".join(kept)
+    return None, f"no lease outcome recorded after seq {after_seq}"
+
+
+# Routing events recording an unroute whose window-side cleanup may have removed the run's window
+# mapping, with the field that counts the unrouted connections.
+WINDOW_MAPPING_PRUNE_EVENTS = {
+    "policy_revoked": "pruned_connection_count",
+    "routing_cleanup_if_unproven": "pruned_connection_count",
+    "proof_lost_routes_unrouted": "unrouted_connection_count",
+}
+
+
+def positive_count(value: Any) -> int | None:
+    """`value` as a positive integer count (a decimal string or int), else None."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        count = int(value)
+        return count if count > 0 else None
+    return None
+
+
+# The routing events recording a run route assigned to a helper connection (re-creating the run's
+# window mapping): by the run's pending policy, restored from the helper session's live-run affinity
+# (a reconnect without one), or a request path (the per-tool-call run-tab rebind, a request
+# rehydrate or run mapping) filling the run's empty window-mapping slot. A request path that
+# yielded the slot to a different holder (`tab_rebind_yielded_to_holder`,
+# `run_mapping_yielded_to_holder`) re-creates nothing and is not one.
+ROUTE_ASSIGNMENT_EVENTS = frozenset({"policy_applied", "live_affinity_route_restored", "run_tab_rebound_empty_slot"})
+
+
+def window_mapping_prunes(
+    events: Iterable[dict[str, Any]], after_seq: int, before_seq: int
+) -> list[dict[str, Any]]:
+    """Recorded unroutes whose window-side cleanup removed the run's window mapping
+    (`window_mapping_removed=true` with a positive unrouted count), after the run's last route
+    assignment (`ROUTE_ASSIGNMENT_EVENTS`) before `before_seq`, or after `after_seq` (the later turn's
+    boundary) when no assignment was recorded, and before `before_seq`. A prune before that bound
+    never excuses a later turn: the assignment re-created the window mapping after it."""
+    rows = [event for event in events if isinstance(event, dict) and type(event.get("seq")) is int]
+    assignments = [
+        event["seq"] for event in rows if event.get("event") in ROUTE_ASSIGNMENT_EVENTS and event["seq"] < before_seq
+    ]
+    lower = max(assignments) if assignments else after_seq
+    prunes = []
+    for event in rows:
+        if not lower < event["seq"] < before_seq:
+            continue
+        count_field = WINDOW_MAPPING_PRUNE_EVENTS.get(event.get("event"))
+        fields = event.get("fields")
+        if count_field is None or not isinstance(fields, dict):
+            continue
+        if fields.get("window_mapping_removed") == "true" and positive_count(fields.get(count_field)) is not None:
+            prunes.append(event)
+    return prunes
+
+
+def later_turn_routing_path(events: Iterable[dict[str, Any]], after_seq: int) -> tuple[bool | None, str]:
+    """Which path a later turn's lease took, from routing events recorded after `after_seq`.
+
+    The expected later-turn path is the early release: both `route_wait_skipped_proven_route`
+    (the lease) and `policy_released_for_proven_route` (the host) recorded. A revocation with
+    `routing_preserved=true` instead means the 10 s routing wait ran (a refused early release
+    records no event of its own). That is the documented conservative fallback only when an
+    unroute that removed the run's window mapping (`window_mapping_removed=true` with a positive
+    pruned/unrouted count) was recorded before the first such revocation and after the run's last
+    route assignment before it (or after `after_seq` without one; `window_mapping_prunes`), and a
+    FAIL otherwise.
+    False as well when routing was cleared; None when no lease outcome was recorded."""
+    rows = [event for event in events if isinstance(event, dict)]
+    later = [event for event in rows if type(event.get("seq")) is int and event["seq"] > after_seq]
+    names = {event.get("event") for event in later}
+    if all(name in names for name in RETENTION_EARLY_RELEASE_EVENTS):
+        seqs = ", ".join(
+            f"{event.get('event')}#{event.get('seq')}" for event in later if event.get("event") in RETENTION_EARLY_RELEASE_EVENTS
+        )
+        return True, f"early release: {seqs}"
+    revocations = [event for event in later if event.get("event") == "policy_revoked"]
+    for event in revocations:
+        fields = event.get("fields")
+        if not isinstance(fields, dict) or fields.get("routing_preserved") != "true":
+            preserved = fields.get("routing_preserved") if isinstance(fields, dict) else None
+            return False, f"routing cleared: policy_revoked(routing_preserved={preserved!r})#{event.get('seq')}"
+    if revocations:
+        revoked = ", ".join(f"policy_revoked(routing_preserved=true)#{event.get('seq')}" for event in revocations)
+        prunes = window_mapping_prunes(rows, after_seq, min(event["seq"] for event in revocations))
+        if prunes:
+            described = ", ".join(f"{event.get('event')}(window_mapping_removed)#{event.get('seq')}" for event in prunes)
+            return True, f"documented fallback after a prune removed the window mapping ({described}): {revoked}"
+        return False, f"early release did not apply; 10 s wait path ({revoked})"
+    partial = sorted(name for name in names if name in RETENTION_EARLY_RELEASE_EVENTS)
+    if partial:
+        return False, f"incomplete early release: only {', '.join(partial)} recorded after seq {after_seq}"
+    return None, f"no lease outcome recorded after seq {after_seq}"
+
+
+def remaining_wait(submitted_at: float, now: float, required: float) -> float:
+    """Seconds still to wait so that at least `required` seconds have passed since
+    `submitted_at` (monotonic clock values)."""
+    return max(0.0, submitted_at + required - now)
 
 
 def tool_call_counts_by_connection(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
@@ -707,6 +967,8 @@ def log_offset(app_log: Path | None) -> int:
 
 
 def run_scenario(args: argparse.Namespace, scenario: str) -> ScenarioResult:
+    if scenario == "laterturn-kill":
+        return run_laterturn_kill_scenario(args)
     result = ScenarioResult(scenario=scenario)
     cli, window_id = args.cli, args.window_id
     nonce = uuid.uuid4().hex[:10]
@@ -878,6 +1140,219 @@ def run_scenario(args: argparse.Namespace, scenario: str) -> ScenarioResult:
                 result.check("turn 1 was not replayed to Claude", turn1_count == 1, f"{jsonl.name}: occurrences={turn1_count}")
         if not expects_loss:
             result.check("still no loss error after turn 2", DISCONNECT_MARKER not in transcript(cli, window_id, session_id))
+
+        health = health_lines_since(args.app_log, offset)
+        if args.app_log is not None:
+            result.check("mcp.health log lines (informational)", None, f"{len(health)} line(s)")
+            for line in health[-8:]:
+                print(f"  [{scenario}] {line}")
+    except (LiveAcceptanceError, support.SupportError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        result.error = str(error)
+    finally:
+        if session_id is not None and not args.keep_sessions:
+            cleanup_session(cli, window_id, session_id, scenario)
+    return result
+
+
+def check_turn_evidence(
+    result: ScenarioResult,
+    cli: Path,
+    window_id: int,
+    session_id: str,
+    label: str,
+    reply: str,
+    turns_before: int,
+    connection_id: str,
+    calls_before: int,
+) -> None:
+    """The reply and a successful RepoPrompt tool call, from this turn's transcript slice only."""
+    turn_log = transcript(cli, window_id, session_id, offset=turns_before)
+    result.check(
+        f"{label} reply is in an assistant message",
+        reply_in_assistant_message(turn_log, reply),
+        f"assistant_rows={len(tagged_texts(turn_log, 'assistant'))}",
+    )
+    calls_after = tool_call_counts_by_connection(connection_rows(cli, window_id)).get(connection_id, 0)
+    result.check(
+        f"a RepoPrompt tool completed without error in {label}",
+        tool_succeeded(turn_log) and calls_after > calls_before,
+        f"results={tool_results(turn_log)} helper_tool_calls {calls_before}->{calls_after}",
+    )
+
+
+def steer_turn(cli: Path, window_id: int, session_id: str, prompt: str, run_ids: set[str]) -> float:
+    """Steer one turn, add any returned run ID to `run_ids`, and return the monotonic time
+    just before the steer was submitted."""
+    submitted_at = time.monotonic()
+    steer = call(cli, window_id, "agent_run", {"op": "steer", "session_id": session_id, "message": prompt}, 60)
+    steer_run_id = await_run_id(cli, window_id, session_id, steer, set())
+    if steer_run_id:
+        run_ids.add(steer_run_id)
+    return submitted_at
+
+
+def run_laterturn_kill_scenario(args: argparse.Namespace) -> ScenarioResult:
+    """Kill a helper whose route has to survive a later turn's unused routing lease.
+
+    Turn 2 must reuse turn 1's Claude process and helper (same connection, PID and start),
+    else the scenario fails as not exercising retention. Its bootstrap lease then sees no new
+    connection: it is expected to release at once for the launch's proven route (a revoke
+    after the 10 s routing wait is a failed path check unless a prune recorded after the run's
+    last route assignment removed the run's window mapping, `window_mapping_removed=true`).
+    The live, ancestry-proven helper must keep its run route either way (checked by time, and
+    by the required run routing history), so a kill after it still opens the helper-exit
+    watch and reports the loss before turn 3."""
+    scenario = "laterturn-kill"
+    result = ScenarioResult(scenario=scenario)
+    cli, window_id = args.cli, args.window_id
+    nonce = uuid.uuid4().hex[:10]
+    turn1_marker, turn1_reply = f"TURN1-PROMPT-{nonce}", f"TURN1_OK_{nonce}"
+    turn2_marker, turn2_reply = f"TURN2-PROMPT-{nonce}", f"TURN2_OK_{nonce}"
+    turn3_marker, turn3_reply = f"TURN3-PROMPT-{nonce}", f"TURN3_OK_{nonce}"
+    session_id: str | None = None
+    scenario_started = time.time() - 5
+    offset = log_offset(args.app_log)
+    try:
+        start_payload: dict[str, Any] = {
+            "op": "start",
+            "model_id": args.model_id,
+            "detach": True,
+            "session_name": f"PRIVATE Claude MCP recovery live: {scenario}",
+            "message": turn_prompt(turn1_marker, turn1_reply),
+        }
+        if args.workspace_id:
+            start_payload["workspace_id"] = args.workspace_id
+        start = call(cli, window_id, "agent_run", start_payload, 60)
+        session_id = strict_uuid(start.get("session_id"), "session_id")
+        active_run_id = await_run_id(cli, window_id, session_id, start, set())
+        if active_run_id is None:
+            raise LiveAcceptanceError("start did not return a run_id")
+        run_ids = {active_run_id}
+
+        helper = find_run_helper(cli, window_id, run_ids, None, args.timeout)
+        claude_before = helper.claude_pid
+        conversation_before = claude_conversation_id(claude_before)
+        result.check("claude pid captured", True, f"pid={claude_before} conversation={conversation_before}")
+        terminal1 = wait_terminal(cli, window_id, session_id, args.timeout)
+        result.check("turn 1 completed", terminal1.get("status") == "completed", f"status={terminal1.get('status')}")
+
+        # Turn 2 on the same Claude process: no new helper connection arrives.
+        turns_before_turn2 = total_turns(cli, window_id, session_id)
+        calls_before_turn2 = tool_call_counts_by_connection(connection_rows(cli, window_id))
+        history_before_turn2 = required_routing_history(
+            result, cli, window_id, run_ids, "run routing history available before turn 2", "before turn 2"
+        )
+        result.check("run routing history available before turn 2", True, f"latest_seq={history_before_turn2[1]}")
+        turn2_submitted = steer_turn(cli, window_id, session_id, turn_prompt(turn2_marker, turn2_reply), run_ids)
+        helper_turn2 = find_run_helper(cli, window_id, run_ids, claude_before, args.timeout)
+        reused = same_helper_instance(helper, helper_turn2)
+        reuse_detail = (
+            f"turn1={helper.connection_id}/pid {helper.pid}/start {helper.start} "
+            f"turn2={helper_turn2.connection_id}/pid {helper_turn2.pid}/start {helper_turn2.start}"
+        )
+        result.check("turn 2 reused the turn-1 helper", reused, reuse_detail)
+        if not reused:
+            raise LiveAcceptanceError(f"not exercising retention: turn 2 did not reuse the turn-1 helper ({reuse_detail}); nothing killed")
+        terminal2 = wait_terminal(cli, window_id, session_id, args.timeout)
+        result.check("turn 2 completed", terminal2.get("status") == "completed", f"status={terminal2.get('status')}")
+        check_turn_evidence(
+            result, cli, window_id, session_id, "turn 2", turn2_reply, turns_before_turn2,
+            helper_turn2.connection_id, calls_before_turn2.get(helper_turn2.connection_id, 0),
+        )
+        result.check(
+            "turn 2 ran on the same Claude process",
+            process_alive(claude_before) and helper_turn2.claude_pid == claude_before,
+            f"pid={claude_before} helper_pid={helper_turn2.pid}",
+        )
+
+        # Past turn 2's routing wait: its lease has revoked its unused policy by now.
+        time.sleep(remaining_wait(turn2_submitted, time.monotonic(), LATERTURN_ROUTE_CHECK_SECONDS))
+        preserved, detail = preserved_route_helper(connection_rows(cli, window_id), helper_turn2.connection_id, run_ids)
+        same_helper = (
+            preserved is not None and preserved.pid == helper_turn2.pid and preserved.start == helper_turn2.start
+        )
+        result.check("route_preserved", same_helper, detail)
+        if preserved is None or not same_helper:
+            raise LiveAcceptanceError(f"route_preserved: {detail}; nothing killed")
+        # The pre-turn lookup succeeded, so the post-turn one must too (no silent downgrade).
+        history_after_turn2 = required_routing_history(
+            result, cli, window_id, run_ids, "routing history shows turn 2 kept the route",
+            "after turn 2 (the pre-turn lookup succeeded)",
+        )
+        verdict, history_detail = retention_routing_verdict(history_after_turn2[0], history_before_turn2[1])
+        result.check("routing history shows turn 2 kept the route", verdict is True, history_detail)
+        if verdict is not True:
+            raise LiveAcceptanceError(f"routing history: {history_detail}; nothing killed")
+        # The path is its own check: the early release is the expected later-turn path. A wait
+        # path still kept the route (checked above), so the loss half of the scenario still runs.
+        path_ok, path_detail = later_turn_routing_path(history_after_turn2[0], history_before_turn2[1])
+        result.check("turn 2 took the early-release path", path_ok is True, path_detail)
+
+        verify_and_kill_helper(preserved)
+        time.sleep(HELPER_EXIT_SETTLE_SECONDS)
+        marker = REASON_MARKERS[scenario]
+        deadline = time.monotonic() + LOSS_NOTICE_TIMEOUT_SECONDS
+        log_before_turn3 = transcript(cli, window_id, session_id)
+        while not (DISCONNECT_MARKER in log_before_turn3 and marker in log_before_turn3) and time.monotonic() < deadline:
+            time.sleep(1.0)
+            log_before_turn3 = transcript(cli, window_id, session_id)
+        result.check(
+            "transcript shows the loss error before turn 3",
+            DISCONNECT_MARKER in log_before_turn3 and marker in log_before_turn3,
+            marker,
+        )
+
+        if conversation_before is None:
+            conversation_before = conversation_id_from_marker(args.claude_projects_dir, turn1_marker, scenario_started)
+            result.check(
+                "conversation located by turn-1 marker",
+                conversation_before is not None,
+                f"conversation={conversation_before} (needs exactly one recent *.jsonl under {args.claude_projects_dir})",
+            )
+        turns_before_turn3 = total_turns(cli, window_id, session_id)
+        calls_before_turn3 = tool_call_counts_by_connection(connection_rows(cli, window_id))
+        steer_turn(cli, window_id, session_id, turn_prompt(turn3_marker, turn3_reply), run_ids)
+        helper_turn3 = find_run_helper(
+            cli, window_id, run_ids, None, args.timeout,
+            exclude_connection_ids=frozenset({preserved.connection_id}),
+        )
+        terminal3 = wait_terminal(cli, window_id, session_id, args.timeout)
+        result.check("turn 3 completed", terminal3.get("status") == "completed", f"status={terminal3.get('status')}")
+
+        claude_after = helper_turn3.claude_pid
+        resumed = claude_conversation_id(claude_after, flags=("--resume",))
+        result.check(
+            "new Claude process resumed the same conversation",
+            claude_after != claude_before and conversation_before is not None and resumed == conversation_before,
+            f"before={claude_before}/{conversation_before} after={claude_after}/--resume {resumed}",
+        )
+        result.check("old Claude process is gone", not process_alive(claude_before), f"pid={claude_before}")
+        check_turn_evidence(
+            result, cli, window_id, session_id, "turn 3", turn3_reply, turns_before_turn3,
+            helper_turn3.connection_id, calls_before_turn3.get(helper_turn3.connection_id, 0),
+        )
+
+        # Non-replay: turn 1's and turn 2's prompts each occur exactly once in Claude's transcript.
+        replay_check = "turns 1 and 2 were not replayed to Claude"
+        if conversation_before is None:
+            result.check(replay_check, False, "no conversation ID on the Claude command line")
+        else:
+            jsonl = find_claude_transcript(args.claude_projects_dir, conversation_before)
+            if jsonl is None:
+                result.check(
+                    replay_check, False,
+                    f"no unique {conversation_before}.jsonl under {args.claude_projects_dir} (pass --claude-projects-dir)",
+                )
+            else:
+                with jsonl.open("r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+                turn1_count = count_user_prompt_occurrences(lines, turn1_marker)
+                turn2_count = count_user_prompt_occurrences(lines, turn2_marker)
+                result.check(
+                    replay_check,
+                    turn1_count == 1 and turn2_count == 1,
+                    f"{jsonl.name}: turn1={turn1_count} turn2={turn2_count}",
+                )
 
         health = health_lines_since(args.app_log, offset)
         if args.app_log is not None:
