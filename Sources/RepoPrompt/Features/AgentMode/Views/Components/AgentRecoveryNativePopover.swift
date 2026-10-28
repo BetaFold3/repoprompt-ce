@@ -30,6 +30,46 @@ enum AgentRecoveryNativePopoverEventDecision: Equatable {
     }
 }
 
+/// The window operations `AgentRecoveryNativePopoverKeyFocus` needs; `NSWindow` provides them.
+@MainActor
+protocol AgentRecoveryNativePopoverKeyWindow: AnyObject {
+    var isVisible: Bool { get }
+    var canBecomeKey: Bool { get }
+    var isKeyWindow: Bool { get }
+    func makeKey()
+}
+
+extension NSWindow: AgentRecoveryNativePopoverKeyWindow {}
+
+/// Keyboard focus while a native recovery popover is open.
+///
+/// Escape is handled only in the popover's own window, and an `.applicationDefined` popover does not
+/// take key when shown, so Escape pressed straight after opening went to the window behind (P5).
+/// The popover therefore takes key when shown and gives it back to the window that had it when it
+/// closes, so focus ends where it was before the popover opened.
+@MainActor
+enum AgentRecoveryNativePopoverKeyFocus {
+    /// Right after `show`: makes the popover's window key.
+    static func takeKey(popoverWindow: (any AgentRecoveryNativePopoverKeyWindow)?) {
+        guard let popoverWindow, !popoverWindow.isKeyWindow, popoverWindow.canBecomeKey else { return }
+        popoverWindow.makeKey()
+    }
+
+    /// On close, before the popover's window goes away: if it is still key, makes the window that
+    /// was key when the popover opened key again. Otherwise focus has already moved (the user made
+    /// another window key, or AppKit ordered the popover out) and is left alone.
+    static func returnKey(
+        from popoverWindow: (any AgentRecoveryNativePopoverKeyWindow)?,
+        to previousKeyWindow: (any AgentRecoveryNativePopoverKeyWindow)?
+    ) {
+        guard let popoverWindow, popoverWindow.isKeyWindow,
+              let previousKeyWindow, previousKeyWindow !== popoverWindow,
+              previousKeyWindow.isVisible, previousKeyWindow.canBecomeKey
+        else { return }
+        previousKeyWindow.makeKey()
+    }
+}
+
 /// The container of recovery rows (banner or Needs Attention sheet) that row popovers open outside
 /// of, so a row's View popover never covers another row's buttons. Rows put their buttons at the
 /// trailing edge and their widths vary (a run card's can be most of the row), so any placement over
@@ -198,6 +238,8 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
         private var eventMonitor: Any?
         private var resignActiveObserver: NSObjectProtocol?
         private weak var anchor: NSView?
+        /// The window that was key when the popover opened; it gets key back when the popover closes.
+        private weak var previousKeyWindow: NSWindow?
         private weak var region: AgentRecoveryNativePopoverRegion?
         private var isPresented: Binding<Bool>?
 
@@ -237,6 +279,7 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             popover.delegate = self
             self.host = host
             self.popover = popover
+            previousKeyWindow = NSApp.keyWindow
             installMonitors()
             // Outside the rows' region when there is one and the screen has room beside it: shown
             // against the whole region, so whichever edge AppKit settles on stays outside it (the
@@ -257,6 +300,12 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 // The popover may then cover other rows.
                 popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: preferredEdge)
             }
+            // So Escape, handled only in the popover's window, works without clicking inside first.
+            // One main-queue turn later, outside the SwiftUI update that showed it.
+            DispatchQueue.main.async { [weak self, weak popover] in
+                guard let self, let popover, self.popover === popover else { return }
+                AgentRecoveryNativePopoverKeyFocus.takeKey(popoverWindow: popover.contentViewController?.view.window)
+            }
         }
 
         /// Closes the popover (if shown) and reports it closed through the binding. Idempotent.
@@ -265,6 +314,11 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             let popover = popover
             self.popover = nil
             host = nil
+            AgentRecoveryNativePopoverKeyFocus.returnKey(
+                from: popover?.contentViewController?.view.window,
+                to: previousKeyWindow
+            )
+            previousKeyWindow = nil
             popover?.delegate = nil
             popover?.close()
             guard let isPresented else { return }
@@ -292,8 +346,10 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 let consume = MainActor.assumeIsolated { self?.shouldConsume(event) ?? false }
                 return consume ? nil : event
             }
+            // `will`, not `did`: the popover's window is still key, so `close` gives key back to the
+            // window that had it and AppKit restores that window when the app is reactivated.
             resignActiveObserver = NotificationCenter.default.addObserver(
-                forName: NSApplication.didResignActiveNotification,
+                forName: NSApplication.willResignActiveNotification,
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
@@ -327,7 +383,8 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 return true
             case .closeAndDeliver:
                 close()
-                // The popover window was key; make the clicked anchor window key before AppKit
+                // `close` gave key back to the window that had it. If the click is on the anchor's
+                // window and that is still not key, make it key before AppKit
                 // dispatches the event, so it is delivered as a normal click rather than spent
                 // activating the window. Other windows keep normal macOS first-click activation,
                 // so sheets, panels and window order are left to AppKit.
