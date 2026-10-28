@@ -650,7 +650,7 @@ extension AgentModeRunServiceLifecycleTests {
             // Persisted state once every evidence write of the terminal (quit or not) has landed:
             // the same queued intent with no delivery attempt; the run's own attempt carries only its
             // terminal evidence (an app quit is recorded as such), never a dispatch.
-            await fixture.lane.deliveryEvidenceWritesSettled()
+            await fixture.lane.settleEvidenceWrites()
             let persisted = await fixture.lane.store.read(sessionID: fixture.lane.sessionID).record
             XCTAssertEqual(persisted?.intents.first { $0.intentID == intentID }?.deliveryState, .queued, name)
             XCTAssertEqual(persisted?.attempts.count { $0.intentID == intentID }, 0, name)
