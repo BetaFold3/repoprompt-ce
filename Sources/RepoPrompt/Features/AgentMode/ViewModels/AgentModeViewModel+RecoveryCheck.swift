@@ -58,11 +58,20 @@ extension AgentModeViewModel {
     }
 
     /// The Check button's help text. With checks active it names the restriction warning (a
-    /// Refresh that proves a process exited may let already-authorized scheduled sends run).
+    /// Refresh that proves a process exited, or a crash hold confirmed from process records, may let
+    /// already-authorized scheduled sends run).
     var recoveryCheckHelpText: String {
         recoveryChecksActive
-            ? "Refreshes process ownership and checks provider history, then reports what each listed item needs. \(AgentRecoveryCheckStatus.restrictionWarningText)"
+            ? "\(AgentRecoveryCheckStatus.activeNoticeText) Then reports what each listed item needs."
             : "Reports what each listed item needs. Process and provider-history checks are not active, so nothing is changed."
+    }
+
+    /// Shown in the sheet before a check starts while checks are active (Step 9-activation-b): what
+    /// Check may clear or confirm, visible at the moment the user decides to click. `nil` while a
+    /// check report is shown (its header carries the same text) or checks are not active.
+    var recoveryCheckNoticeText: String? {
+        guard recoveryCheckStatus == nil, recoveryChecksActive else { return nil }
+        return AgentRecoveryCheckStatus.activeNoticeText
     }
 
     /// Stops the running check before its next item; checked items keep their result.

@@ -14,11 +14,16 @@ import Foundation
 //     record. Its report comes from the runner's typed result: record commits reach the catalog
 //     asynchronously (`store.commitPublisher` → a main-actor adoption task), so a re-read right
 //     after the Reconcile may still show the card as it was;
+//   - per crash hold ("Sending paused") still as captured, confirmation from process records only
+//     (Step 9-activation-b, `AgentRecoveryCoordinator+CrashHoldProof.swift`): its one write is the
+//     exact crash-hold acknowledgement, committed only when the registry proves every process an
+//     earlier launch started for the session exited and each held run was registered at run start.
+//     Confirming lets the session send again, so already-authorized scheduled sends may run;
 //   - for every other item, the catalog as it is when the item's turn comes.
 // Before activation it does none of these and reports "Process and provider-history checks are not
 // active."; items are then reported from the catalog only and nothing is resolved automatically.
-// It never sends, stops, discards, dismisses, confirms a crash hold or a schedule, opens a session
-// or starts a turn. (Crash-hold confirmation from registry proof of exit is not built here.)
+// It never sends, stops, discards, dismisses, confirms a schedule, opens a session or starts a turn,
+// and confirms a crash hold only from that proof (never from an empty registry).
 
 /// A one-shot wait for one Check item: the first `finish` wins (the item's result, or `nil` for
 /// Stop); later ones are ignored, so a late result never reaches a finished report.
@@ -26,17 +31,26 @@ import Foundation
 final class AgentRecoveryCheckItemWait {
     private var continuation: CheckedContinuation<AgentRecoveryCheckOutcome?, Never>?
     private var result: AgentRecoveryCheckOutcome??
-    /// The item's Reconcile was called (the window marks its row `.working` before its first
-    /// suspension), so a Stop after this owns that `.working` state; before it, Check set nothing.
-    private(set) var reconcileStarted = false
+    /// The item's work started: its Reconcile was called (the window marks its row `.working`
+    /// before its first suspension) or its crash-hold confirmation marked the row `.working`. A Stop
+    /// after a Reconcile started owns that `.working` state; before it, Check set nothing.
+    private(set) var workStarted = false
+    /// The started work is a crash-hold confirmation: it clears its own `.working` when it ends, and
+    /// a Stop reports `stoppedWhileConfirmingText` (the write may or may not have been made).
+    private(set) var confirmsCrashHold = false
 
     /// Finished by its result or by Stop: work that hasn't started yet must not start.
     var isFinished: Bool {
         result != nil
     }
 
-    func markReconcileStarted() {
-        reconcileStarted = true
+    func markWorkStarted() {
+        workStarted = true
+    }
+
+    func markCrashHoldConfirmationStarted() {
+        workStarted = true
+        confirmsCrashHold = true
     }
 
     func value() async -> AgentRecoveryCheckOutcome? {
@@ -147,8 +161,15 @@ package struct AgentRecoveryCheckStatus: Equatable {
     package static let abandonedText = "Stopped while checking. Its check continues; the card shows the result."
     /// The item Stop reached before its check started (it never starts, so no result follows).
     package static let stoppedBeforeCheckingText = "Stopped before checking this item."
+    /// The crash hold being confirmed when Stop was pressed: its write may have been made or not.
+    package static let stoppedWhileConfirmingText = "Stopped while confirming. If it was saved, its card shows sending resumed."
     package static let restrictionWarningText =
-        "Clearing a restriction may let already-authorized scheduled sends run."
+        "Clearing a restriction or confirming a paused session may let already-authorized scheduled sends run."
+    /// What an active check does (header, help, and the sheet's text before a check starts).
+    package static let activeDescriptionText =
+        "Checks process ownership and provider history, and confirms a paused session stopped when process records prove its processes exited."
+    /// The authorization text shown before a check starts while checks are active.
+    package static let activeNoticeText = "\(activeDescriptionText) \(restrictionWarningText)"
 
     package let checksActive: Bool
     /// Captured items, in displayed order.
@@ -167,10 +188,11 @@ package struct AgentRecoveryCheckStatus: Equatable {
     }
 
     /// The report header: inactive checks, or what is checked and the restriction warning (a
-    /// Refresh that proves a process exited clears its restriction).
+    /// Refresh that proves a process exited clears its restriction; a proven crash-hold
+    /// confirmation lets its session send again).
     package var headerText: String {
         checksActive
-            ? "Checks process ownership and provider history. \(Self.restrictionWarningText)"
+            ? Self.activeNoticeText
             : "\(Self.checksInactiveText) Items are reported as they are; nothing was changed."
     }
 
@@ -252,19 +274,26 @@ package extension AgentRecoveryCoordinator {
             let waited = await waitForCheckOutcome(of: item, checksActive: checksActive, reconcile: reconcile)
             guard let outcome = waited.outcome else {
                 // Stopped while this item was being checked: stop waiting for it (never cancel it).
-                // Its Reconcile, if started, continues and reports on its card; otherwise it never runs.
+                // Its Reconcile, if started, continues and reports on its card; a crash-hold
+                // confirmation may already be writing (or may refuse); otherwise it never runs.
+                let stopText = if !waited.workStarted {
+                    AgentRecoveryCheckStatus.stoppedBeforeCheckingText
+                } else if waited.confirmsCrashHold {
+                    AgentRecoveryCheckStatus.stoppedWhileConfirmingText
+                } else {
+                    AgentRecoveryCheckStatus.abandonedText
+                }
                 recoveryCheck?.entries.append(AgentRecoveryCheckEntry(
                     itemID: item.id,
                     label: item.checkLabel,
-                    outcome: .couldNotCheck(
-                        waited.reconcileStarted ? AgentRecoveryCheckStatus.abandonedText : AgentRecoveryCheckStatus.stoppedBeforeCheckingText
-                    )
+                    outcome: .couldNotCheck(stopText)
                 ))
                 recoveryCheck?.notChecked = captured.count - index - 1
-                // Only the `.working` this item's own Reconcile set (it is set before the Reconcile's
-                // first suspension, so it is in place whenever Stop can run); if the Reconcile never
-                // started, a `.working` row belongs to another action and is left alone.
-                if waited.reconcileStarted, catalogActionStates[item.id] == .working {
+                // Only the `.working` this item's own Reconcile set (the window sets it before the
+                // Reconcile's first suspension, so it is in place whenever Stop can run); a crash-hold
+                // confirmation clears its own when it ends (a commit may still be in flight). If its
+                // work never started, a `.working` row belongs to another action and is left alone.
+                if waited.workStarted, !waited.confirmsCrashHold, catalogActionStates[item.id] == .working {
                     setCatalogActionState(nil, for: item.id)
                 }
                 break
@@ -286,32 +315,33 @@ package extension AgentRecoveryCoordinator {
         recoveryCheckItemWait?.finish(nil)
     }
 
-    /// One item's outcome, or `nil` when Stop ended the wait first, and whether its Reconcile was
-    /// called. The item's work runs in its own unstructured task that nothing cancels; whichever of
-    /// its result or Stop comes first resumes the one-shot wait, and the other is ignored. A task
-    /// that runs only after Stop finished its wait does nothing (no new Reconcile after Stop).
+    /// One item's outcome, or `nil` when Stop ended the wait first; whether its work (Reconcile or
+    /// crash-hold confirmation) started, and whether that work confirms a crash hold. The item's work
+    /// runs in its own unstructured task that nothing cancels; whichever of its result or Stop comes
+    /// first resumes the one-shot wait, and the other is ignored. A task that runs only after Stop
+    /// finished its wait does nothing (no new Reconcile after Stop).
     private func waitForCheckOutcome(
         of item: AgentRecoveryCatalogItem,
         checksActive: Bool,
         reconcile: @escaping @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile
-    ) async -> (outcome: AgentRecoveryCheckOutcome?, reconcileStarted: Bool) {
+    ) async -> (outcome: AgentRecoveryCheckOutcome?, workStarted: Bool, confirmsCrashHold: Bool) {
         let wait = AgentRecoveryCheckItemWait()
         recoveryCheckItemWait = wait
         defer { if recoveryCheckItemWait === wait { recoveryCheckItemWait = nil } }
         let tracked: @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile = { item in
-            wait.markReconcileStarted()
+            wait.markWorkStarted()
             return await reconcile(item)
         }
         Task { @MainActor [weak self] in
             guard !wait.isFinished else { return }
             guard let self else { return wait.finish(.couldNotCheck("Recovery isn't available right now.")) }
-            await wait.finish(checkOutcome(of: item, checksActive: checksActive, reconcile: tracked))
+            await wait.finish(checkOutcome(of: item, checksActive: checksActive, wait: wait, reconcile: tracked))
         }
         #if DEBUG
             test_recoveryCheckItemQueued?()
         #endif
         let outcome = await wait.value()
-        return (outcome, wait.reconcileStarted)
+        return (outcome, wait.workStarted, wait.confirmsCrashHold)
     }
 
     /// Clears the last finished check's report (the sheet was closed); a running one stays.
@@ -324,6 +354,7 @@ package extension AgentRecoveryCoordinator {
     private func checkOutcome(
         of item: AgentRecoveryCatalogItem,
         checksActive: Bool,
+        wait: AgentRecoveryCheckItemWait,
         reconcile: @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile
     ) async -> AgentRecoveryCheckOutcome {
         if catalogActionStates[item.id] == .working {
@@ -347,6 +378,12 @@ package extension AgentRecoveryCoordinator {
         }
         if current.isDismissed {
             return .couldNotCheck("It was dismissed.")
+        }
+        // A crash hold: confirmed only from process-record proof (checks are active here). The proof
+        // compares the card with the captured one, sets the row `.working` and marks its work started
+        // before its first suspension.
+        if case let .crashHold(hold) = current.payload {
+            return await confirmCrashHoldFromRegistryProof(item, hold: hold, wait: wait)
         }
         guard current.isRunCard, current.attention == .informational else {
             return current.checkOutcome(unresolvedRun: .couldNotCheck("This card needs action; Check doesn't reconcile it."))

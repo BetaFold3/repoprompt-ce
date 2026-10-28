@@ -290,7 +290,9 @@ package final class AgentRecoveryDispatchEvidence {
                 ownership: ownership,
                 processRunID: processRunID,
                 transcriptTurnID: executionTurnID(of: constituents.first, in: session),
-                providerKindRaw: ownership.providerKindRaw
+                providerKindRaw: ownership.providerKindRaw,
+                // The dispatch commit precedes the run's first provider write: its mark.
+                runtimeRegistrationRaw: ownership.runtimeRegistrationRaw
             ) {
                 return .failure(.commitFailed(failure))
             }

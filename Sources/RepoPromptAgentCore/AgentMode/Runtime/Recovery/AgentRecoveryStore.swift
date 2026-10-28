@@ -1156,6 +1156,18 @@ package actor AgentRecoveryStore {
 
     // MARK: Run-attempt evidence
 
+    /// The run-start extras of a newly recorded attempt: its provider and its registration mark.
+    private static func runStartExtras(providerKindRaw: String?, runtimeRegistrationRaw: String?) -> AgentRecoveryExtras {
+        var extras: AgentRecoveryExtras = [:]
+        if let providerKindRaw {
+            extras[AgentRecoveryRunAttempt.providerKindExtrasKey] = .string(providerKindRaw)
+        }
+        if let runtimeRegistrationRaw {
+            extras[AgentRecoveryRunAttempt.runtimeRegistrationExtrasKey] = .string(runtimeRegistrationRaw)
+        }
+        return extras
+    }
+
     /// Ensures evidence for the existing run attempt `ownership.attemptID`, capturing the binding's
     /// reset generation. A process-run or transcript-turn association may be completed later.
     /// The transcript turn is the first one recorded (the turn the run's first carried input opened);
@@ -1163,7 +1175,10 @@ package actor AgentRecoveryStore {
     /// is `.keepExisting` (terminal-time completion, which never fails on an existing association).
     /// `providerKindRaw` is run-start evidence written only when the attempt is first recorded
     /// (extras member `providerKind`); an existing attempt's (or a legacy attempt's absent) provider
-    /// is never rewritten.
+    /// is never rewritten. `runtimeRegistrationRaw` (extras member `runtimeRegistration`) is the same
+    /// kind of run-start evidence: only the creator that precedes the run's first provider write
+    /// passes it, every other writer passes `nil`, and it is never added to or removed from an
+    /// existing attempt.
     package func ensureRunAttempt(
         binding: AgentRecoveryLifecycleBinding,
         expectedRevision: AgentRecoveryRecordRevision?,
@@ -1171,7 +1186,8 @@ package actor AgentRecoveryStore {
         processRunID: UUID?,
         transcriptTurnID: UUID?,
         processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict,
-        providerKindRaw: String?
+        providerKindRaw: String?,
+        runtimeRegistrationRaw: String? = nil
     ) throws -> AgentRecoveryRunReceipt {
         try requireOwnership(ownership, binding: binding)
         let current = try writableRecord(binding: binding)
@@ -1204,7 +1220,7 @@ package actor AgentRecoveryStore {
                 // Run-start ownership evidence; an existing attempt's (or a legacy attempt's
                 // absent) instance is never rewritten.
                 appInstanceID: appInstanceID,
-                extras: providerKindRaw.map { [AgentRecoveryRunAttempt.providerKindExtrasKey: .string($0)] } ?? [:]
+                extras: Self.runStartExtras(providerKindRaw: providerKindRaw, runtimeRegistrationRaw: runtimeRegistrationRaw)
             ))
         }
         try requireRevision(expectedRevision, current: current)
@@ -1566,7 +1582,8 @@ package actor AgentRecoveryStore {
     /// An identical acknowledgement is unchanged; a different one replaces it (a newer decision
     /// about a changed uncertainty set). Nothing else in the record changes: no run is closed,
     /// no delivery state or outcome is touched. Creates the record when absent (a hold of legacy
-    /// interrupted turns only).
+    /// interrupted turns only). With `undismissedCard` (Check and resolve), refuses with `.cardChanged`
+    /// when that card was dismissed in exactly that state.
     package func recordCrashHoldAcknowledgement(
         binding: AgentRecoveryLifecycleBinding,
         expectedRevision: AgentRecoveryRecordRevision?,
@@ -1574,7 +1591,8 @@ package actor AgentRecoveryStore {
         transcriptResetGeneration: UInt64,
         runAttemptIDs: Set<UUID>,
         intentIDs: Set<UUID>,
-        transcriptTurnIDs: Set<UUID>
+        transcriptTurnIDs: Set<UUID>,
+        undismissedCard: (key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness)? = nil
     ) throws -> AgentRecoveryLocalReceipt {
         guard binding.incarnationID == incarnationID,
               binding.transcriptResetGeneration == transcriptResetGeneration
@@ -1582,6 +1600,13 @@ package actor AgentRecoveryStore {
             throw AgentRecoveryStoreError.staleIncarnation(expected: binding.incarnationID, actual: incarnationID)
         }
         let current = try writableRecord(binding: binding)
+        // Check's confirmation (Step 9-activation-b): the card it captured must still be undismissed,
+        // checked atomically with the write (a Dismiss may commit after Check's last look).
+        if let undismissedCard,
+           current?.isCardAcknowledged(undismissedCard.key, freshness: undismissedCard.freshness) == true
+        {
+            throw AgentRecoveryStoreError.cardChanged
+        }
         for runAttemptID in runAttemptIDs where current?.runAttempt(id: runAttemptID) == nil {
             throw AgentRecoveryStoreError.runAttemptNotFound(runAttemptID)
         }

@@ -186,7 +186,7 @@ struct AgentRecoveryNeedsAttentionSheet: View {
     }
 
     /// The app-wide Check and resolve's header, progress or summary and per-item results, with Stop
-    /// while it runs.
+    /// while it runs; before it runs (checks active), the sentence its header will show.
     @ViewBuilder
     private var checkReport: some View {
         if let status = agentModeVM.recoveryCheckStatus {
@@ -223,6 +223,13 @@ struct AgentRecoveryNeedsAttentionSheet: View {
             .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.secondary.opacity(0.08)))
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("agent.recoveryNeedsAttention.checkReport")
+        } else if let notice = agentModeVM.recoveryCheckNoticeText {
+            // Before Check runs, the same sentence its header shows (Step 9-activation-b).
+            Text(notice)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("agent.recoveryNeedsAttention.checkNotice")
         }
     }
 }

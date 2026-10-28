@@ -826,6 +826,11 @@ package final class AgentTabSession: ObservableObject {
     /// inactive admission still honors its shared action holds (review A P1-01).
     package weak var recoveryCoordinator: AgentRecoveryCoordinator?
 
+    /// The launch authority this session's managed provider launchers resolve (they default to the
+    /// same `.production` value; tests inject both). Read once per run, at run start, only to derive
+    /// the run-start registration mark (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`).
+    package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority = .production
+
     /// The managed session context of this tab's provider work right now: the live lane's durable
     /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`
     /// (never a fabricated or sessionless identity) when no live recovery lane binds the session.
@@ -2003,7 +2008,12 @@ package final class AgentTabSession: ObservableObject {
             attemptID: attemptID,
             turnEpoch: turnEpoch,
             // The run's provider, captured once at run start (recovery records it on the attempt).
-            providerKindRaw: selectedAgent.rawValue
+            providerKindRaw: selectedAgent.rawValue,
+            // Whether this run's launches are registered (Step 9-activation-b), from the same
+            // authority and provider. A run on an authoritative remote host launches nothing here.
+            runtimeRegistrationRaw: remoteHost == nil
+                ? runtimeLaunchAuthority.runStartRegistrationMark(providerKindRaw: selectedAgent.rawValue)
+                : nil
         )
         attentionTextProvenance = AttentionTextProvenance(
             attemptID: ownership.attemptID,

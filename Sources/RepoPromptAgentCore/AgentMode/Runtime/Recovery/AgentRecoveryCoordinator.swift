@@ -537,6 +537,12 @@ package final class AgentRecoveryCoordinator {
         /// Runs after an item's wait is installed and its work queued, before Check waits on it
         /// (lets a test press Stop before the item's work has started).
         package var test_recoveryCheckItemQueued: (@MainActor () -> Void)?
+        /// Runs before each commit attempt of a registry-proven crash-hold confirmation, before its
+        /// last re-check (lets a test press Stop or change the card at that point).
+        package var test_crashHoldProofBeforeCommit: (@MainActor () async -> Void)?
+        /// Runs after the last re-check, immediately before the acknowledgement write (lets a test
+        /// commit a Dismiss or press Stop once nothing re-checks any more).
+        package var test_crashHoldProofAtCommit: (@MainActor () async -> Void)?
     #endif
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
@@ -1249,6 +1255,11 @@ package final class AgentRecoveryCoordinator {
         recoveryActionHolds.values.contains { $0.authorization.sessionID == sessionID && $0.request.itemKey == itemKey }
     }
 
+    /// Whether any explicit recovery action holds `sessionID` right now (whichever card it is on).
+    func hasRecoveryActionHold(sessionID: UUID) -> Bool {
+        ownRecoveryActionHold(sessionID: sessionID) != nil
+    }
+
     /// Whether an action of a session other than `sessionID` holds `workspaceID`.
     package func hasRecoveryAction(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
         recoveryActionHolds.values.contains { $0.workspaceID == workspaceID && $0.authorization.sessionID != sessionID }
@@ -1612,8 +1623,25 @@ package final class AgentRecoveryCoordinator {
         guard isCurrent() else { return false }
         if confirmedCrashHolds[hold.sessionID] == hold { return true }
         guard case .success = await lane.recordCrashHoldAcknowledgement(hold), isCurrent() else { return false }
-        confirmedCrashHolds[hold.sessionID] = hold
-        postCoordinatorDidChange()
+        return publishCrashHoldConfirmation(hold)
+    }
+
+    /// Whether exactly `hold` is published as confirmed.
+    func isCrashHoldConfirmed(_ hold: AgentRecoveryCrashHold) -> Bool {
+        confirmedCrashHolds[hold.sessionID] == hold
+    }
+
+    /// The one post-commit publication of a crash-hold confirmation, shared by "It stopped"
+    /// (`confirmCrashHold(_:lane:)`) and Check and resolve's registry-proven confirmation: called
+    /// only after the exact acknowledgement of `hold` committed. Publishes it as confirmed (lifting
+    /// admission and the workspace-busy extension, so already-authorized scheduled sends may run)
+    /// when it is still the published hold; `false` (nothing lifted) when the hold changed.
+    func publishCrashHoldConfirmation(_ hold: AgentRecoveryCrashHold) -> Bool {
+        guard crashHolds[hold.sessionID] == hold else { return false }
+        if confirmedCrashHolds[hold.sessionID] != hold {
+            confirmedCrashHolds[hold.sessionID] = hold
+            postCoordinatorDidChange()
+        }
         return true
     }
 
@@ -2699,7 +2727,9 @@ package final class AgentRecoverySessionLane {
                 transcriptTurnID: nil,
                 processRunAssociation: .keepExisting,
                 // The run-start provider, if this write creates the attempt.
-                providerKindRaw: run.ownership.providerKindRaw
+                providerKindRaw: run.ownership.providerKindRaw,
+                // Shutdown evidence never precedes the run's first provider write: no mark.
+                runtimeRegistrationRaw: nil
             ) {
                 return .failure(.evidenceNotPersisted(failure))
             }
@@ -3008,12 +3038,16 @@ package final class AgentRecoverySessionLane {
 
     /// `providerKindRaw`: the run's provider captured at run start (`ownership.providerKindRaw`),
     /// recorded only when this write creates the attempt. Required so every writer states it.
+    /// `runtimeRegistrationRaw`: the run-start registration mark (`ownership.runtimeRegistrationRaw`),
+    /// passed only by the creator that precedes the run's first provider write (the dispatch
+    /// commit); every later writer passes `nil`. Recorded only when this write creates the attempt.
     package func ensureRunAttempt(
         ownership: AgentRunOwnership,
         processRunID: UUID?,
         transcriptTurnID: UUID?,
         processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict,
-        providerKindRaw: String?
+        providerKindRaw: String?,
+        runtimeRegistrationRaw: String? = nil
     ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
         await transaction { store, binding in
             try await store.ensureRunAttempt(
@@ -3023,7 +3057,8 @@ package final class AgentRecoverySessionLane {
                 processRunID: processRunID,
                 transcriptTurnID: transcriptTurnID,
                 processRunAssociation: processRunAssociation,
-                providerKindRaw: providerKindRaw
+                providerKindRaw: providerKindRaw,
+                runtimeRegistrationRaw: runtimeRegistrationRaw
             )
         }
     }
@@ -3110,7 +3145,9 @@ package final class AgentRecoverySessionLane {
                 processRunID: commit.expectedRunID,
                 transcriptTurnID: transcriptTurnID,
                 processRunAssociation: .keepExisting,
-                providerKindRaw: commit.ownership.providerKindRaw
+                providerKindRaw: commit.ownership.providerKindRaw,
+                // Terminal evidence never precedes the run's first provider write: no mark.
+                runtimeRegistrationRaw: nil
             ) {
                 failure = ensureFailure
             } else if case let .failure(terminalFailure) = await recordRunTerminal(commit) {

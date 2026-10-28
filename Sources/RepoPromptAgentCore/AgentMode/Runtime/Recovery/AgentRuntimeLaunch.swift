@@ -105,6 +105,26 @@ package enum AgentRuntimeLaunchAuthority {
         return AgentRuntimeLaunch(registry: registry, context: context)
     }
 
+    /// The run-start registration mark (Step 9-activation-b) of a run started with `providerKindRaw`
+    /// under this authority: `AgentRecoveryRunAttempt.registeredRuntimeRegistration` only when this
+    /// is the registry and every supported family that can serve the run's actual provider is
+    /// covered, so whichever route launches the run's processes registers them (fail closed: a
+    /// registered launch never falls back to unregistered execution). `nil` while activation is off,
+    /// for an uncovered or partially covered provider, and for an unknown provider. The one place the
+    /// mark is derived; callers pass the authority their managed launchers use.
+    package func runStartRegistrationMark(providerKindRaw: String?) -> String? {
+        guard case let .registry(registry) = self, registry.isAnyPairRegistered,
+              let providerKindRaw,
+              let kind = AgentProviderKind(rawValue: providerKindRaw),
+              let provider = AgentRuntimeProvider(agentKind: kind)
+        else { return nil }
+        let serving = AgentRuntimeQualification.supportedPairs.filter { $0.provider == provider }
+        guard !serving.isEmpty,
+              serving.allSatisfy({ registry.qualification.covers(family: $0.family, provider: provider) })
+        else { return nil }
+        return AgentRecoveryRunAttempt.registeredRuntimeRegistration
+    }
+
     /// Whether fresh Claude `--session-id` preallocation is qualified for this actual provider (a
     /// separate gate; never combined with `--resume`).
     package func allowsFreshSessionID(_ family: AgentRuntimeFamily, provider: AgentRuntimeProvider) -> Bool {

@@ -337,6 +337,55 @@ package struct AgentRuntimeRestrictionSnapshot: Equatable {
     }
 }
 
+// MARK: - Crash-hold exit proof (Step 9-activation-b)
+
+/// What Check and resolve asks the registry before it confirms one crash hold from process records:
+/// the held session, the held run attempts, and what the session touches (from the windows hosting
+/// it; the registry adds every conversation and worktree its own associations name for the session).
+package struct AgentRuntimeCrashHoldExitQuery: Equatable {
+    package var sessionID: UUID
+    package var incarnationID: UUID
+    package var runAttemptIDs: Set<UUID>
+    package var conversationIDs: Set<String>
+    package var worktreePaths: [String]
+    /// The recovery store's app instance (this launch): every record of another instance is an
+    /// earlier launch's. A registry over a store of another instance cannot answer (F8).
+    package var currentAppInstanceID: UUID
+
+    package init(
+        sessionID: UUID,
+        incarnationID: UUID,
+        runAttemptIDs: Set<UUID>,
+        conversationIDs: Set<String>,
+        worktreePaths: [String],
+        currentAppInstanceID: UUID
+    ) {
+        self.sessionID = sessionID
+        self.incarnationID = incarnationID
+        self.runAttemptIDs = runAttemptIDs
+        self.conversationIDs = conversationIDs
+        self.worktreePaths = worktreePaths
+        self.currentAppInstanceID = currentAppInstanceID
+    }
+}
+
+/// The registry's answer to `AgentRuntimeCrashHoldExitQuery`, checked in this order. Only `.proven`
+/// lets Check confirm the hold. `.exited` and `.stopped` are terminal and never re-examined, so a
+/// stale answer can only refuse, never confirm.
+package enum AgentRuntimeCrashHoldExitProof: Equatable {
+    /// Every earlier-launch record that could belong to the session is exited or stopped, and each
+    /// held run attempt is named by at least one earlier-launch record.
+    case proven
+    /// Ownership can't be read: not started, storage failure, unidentified records, an unreadable
+    /// record naming the session or what it touches, or a store of another app instance.
+    case ownershipUncertain
+    /// An earlier-launch record that names the session (any incarnation), names no session, or shares
+    /// one of the session's conversations or worktrees is not exited or stopped (tools included).
+    case mayBeRunning
+    /// A held run attempt is named by no earlier-launch record.
+    case runNotRecorded
+}
+
 enum AgentRuntimePaths {
     static func standardized(_ path: String) -> String {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path

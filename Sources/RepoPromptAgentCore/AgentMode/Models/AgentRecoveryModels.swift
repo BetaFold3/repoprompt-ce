@@ -761,6 +761,22 @@ package struct AgentRecoveryRunAttempt: Equatable {
         return nil
     }
 
+    /// Extras member naming how the run's provider launches were owned when the run started
+    /// (Step 9-activation-b): optional run-start evidence, written only when the attempt is first
+    /// recorded by the creator that precedes the run's first provider write, never rewritten.
+    package static let runtimeRegistrationExtrasKey = "runtimeRegistration"
+    /// `runtimeRegistration` value: every family that can serve the run's provider registered its
+    /// launches with the process registry (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`).
+    /// A string, so a later authority kind can be told apart without a schema change.
+    package static let registeredRuntimeRegistration = "registry"
+
+    /// The run-start registration mark, or `nil` for a run started without registered launches (or
+    /// recorded before the mark existed): such a run's processes can never be proven exited.
+    package var recordedRuntimeRegistrationRaw: String? {
+        if case let .string(value)? = extras[Self.runtimeRegistrationExtrasKey] { return value }
+        return nil
+    }
+
     package init(
         runAttemptID: UUID,
         transcriptResetGeneration: UInt64,

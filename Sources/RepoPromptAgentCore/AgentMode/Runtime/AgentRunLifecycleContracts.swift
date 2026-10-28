@@ -86,17 +86,23 @@ package struct AgentRunOwnership: Equatable, Hashable {
     /// when the attempt began; every recovery writer that can create the run attempt records this,
     /// never the session's provider at write time. `nil` when not captured (fails closed).
     package let providerKindRaw: String?
+    /// The run-start registration mark (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`),
+    /// captured once with `providerKindRaw` from the authority the session's managed launchers use.
+    /// Only the run-attempt creator that precedes the run's first provider write records it.
+    package let runtimeRegistrationRaw: String?
 
     init(
         attemptID: UUID = UUID(),
         binding: AgentRunBindingIdentity,
         turnEpoch: AgentRunTurnEpoch? = nil,
-        providerKindRaw: String? = nil
+        providerKindRaw: String? = nil,
+        runtimeRegistrationRaw: String? = nil
     ) {
         self.attemptID = attemptID
         self.binding = binding
         self.turnEpoch = turnEpoch
         self.providerKindRaw = providerKindRaw
+        self.runtimeRegistrationRaw = runtimeRegistrationRaw
     }
 }
 
@@ -206,6 +212,7 @@ package struct AgentRunLifecycleTracker: Equatable {
         attemptID: UUID = UUID(),
         turnEpoch: AgentRunTurnEpoch? = nil,
         providerKindRaw: String? = nil,
+        runtimeRegistrationRaw: String? = nil,
         timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> AgentRunOwnership {
         let ownership = AgentRunOwnership(
@@ -217,7 +224,8 @@ package struct AgentRunLifecycleTracker: Equatable {
                 bindingTransitionGeneration: bindingTransitionGeneration
             ),
             turnEpoch: turnEpoch,
-            providerKindRaw: providerKindRaw
+            providerKindRaw: providerKindRaw,
+            runtimeRegistrationRaw: runtimeRegistrationRaw
         )
         activeOwnership = ownership
         liveness = AgentRunLivenessSnapshot(

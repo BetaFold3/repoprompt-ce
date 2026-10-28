@@ -310,7 +310,9 @@ final class AgentProviderHandoff {
             ownership: ownership,
             processRunID: processRunID,
             transcriptTurnID: AgentRecoveryDispatchEvidence.executionTurnID(of: constituents.first, in: session),
-            providerKindRaw: ownership.providerKindRaw
+            providerKindRaw: ownership.providerKindRaw,
+            // The run-start dispatch commit precedes the run's first provider write: its mark.
+            runtimeRegistrationRaw: ownership.runtimeRegistrationRaw
         ) {
             return .failure(failure)
         }

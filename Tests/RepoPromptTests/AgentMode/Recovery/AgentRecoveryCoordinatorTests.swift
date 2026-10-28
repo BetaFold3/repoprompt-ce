@@ -2876,7 +2876,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(status.summaryText, "Checked 6 of 6 · 2 resolved · 2 need you · 1 could not check · 1 failed")
         XCTAssertEqual(
             status.headerText,
-            "Checks process ownership and provider history. Clearing a restriction may let already-authorized scheduled sends run."
+            "Checks process ownership and provider history, and confirms a paused session stopped when process records prove its processes exited. Clearing a restriction or confirming a paused session may let already-authorized scheduled sends run."
         )
     }
 

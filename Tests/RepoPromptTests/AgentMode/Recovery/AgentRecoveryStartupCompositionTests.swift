@@ -519,6 +519,139 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(starts.count, 1, "Exactly one dispatch")
     }
 
+    /// Step 9-activation-b (review A P2-02, B A7): the same already-authorized new-session Send now
+    /// stays undispatched while Check confirms the crash hold from process records (the hold's run
+    /// was registered at run start and its only earlier-launch record exited), and dispatches
+    /// exactly once after the acknowledgement commits. The held session is never opened.
+    func testCrashHoldBlocksNewSessionSendNowUntilCheckConfirmsItThenDispatchesOnce() async throws {
+        let fixture = try makeFixture()
+        let processes = ScriptedProcessSystem()
+
+        // Earlier launch (no clean exit): a registered run was in flight in this workspace's session.
+        let earlier = makeLaunch(fixture)
+        let earlierStore = earlier.store
+        let held = try await makeSession(earlier, fixture: fixture)
+        let heldOwnership = Support.ownership(sessionID: held.session.id)
+        let heldGate = try earlier.service.recoveryLifecycleGate(for: held.persistenceState)
+        let heldBinding = heldGate.binding
+        try await heldGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                ownership: heldOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil,
+                providerKindRaw: AgentProviderKind.claudeCode.rawValue,
+                runtimeRegistrationRaw: AgentRecoveryRunAttempt.registeredRuntimeRegistration
+            )
+        }
+        try AgentProcessRegistryFixtures.seed(
+            rootURL: fixture.recoveryRoot,
+            state: .exited,
+            root: processes.identity(pid: 7100),
+            rootGroup: 7100,
+            associations: [AgentRuntimeAssociation(
+                session: AgentRuntimeSessionAssociation(lifecycle: heldBinding, runAttemptID: heldOwnership.attemptID, processRunID: nil),
+                conversationID: "conv-held",
+                worktreePath: fixture.storageURL.path,
+                permission: .unavailable
+            )],
+            conversationIDs: ["conv-held"],
+            worktreePaths: [fixture.storageURL.path]
+        )
+
+        // This launch: the real composition with a registry over its store (scripted processes).
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destinations = [fixture.destination]
+        let registry = AgentProcessRegistry(
+            store: now.store,
+            qualification: AgentRecoveryActivation.claudeAndCodex.runtime,
+            system: processes.system
+        )
+        addTeardownBlock { await registry.disposeWatches() }
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            processRegistry: registry,
+            activation: .claudeAndCodex,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: destinations) }
+        )
+        let viewModel = makeViewModel(windowID: 4813, fixture: fixture)
+        viewModel.test_initializeRunService()
+        composition.install(into: viewModel)
+        viewModel.attachScheduledSendCoordinator(scheduler)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        XCTAssertTrue(scheduler.isStartupAdmissionOpen)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+        XCTAssertNotNil(coordinator.blockingCrashHold(for: heldBinding))
+
+        // Another tab in the same workspace schedules a new-session start and sends it now.
+        let scheduledTabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(scheduledTabID)
+        let scheduledTab = try await viewModel.ensureSessionReady(tabID: scheduledTabID)
+        scheduledTab.appendItem(.user("Earlier turn"))
+        let saved = await viewModel.flushSave(for: scheduledTabID)
+        XCTAssertTrue(saved)
+        final class Starts {
+            var count = 0
+        }
+        let starts = Starts()
+        viewModel.scheduledDispatchRunStarter = { [starts] _, _, _, _ in
+            starts.count += 1
+            return .stale(reason: "test starter")
+        }
+        let scheduleID = try await viewModel.installScheduledSend(
+            text: "Start after the interrupted session",
+            on: scheduledTab,
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: true
+        ).get()
+        let message = await viewModel.sendScheduledSendNow(
+            tabID: scheduledTabID,
+            scheduleID: scheduleID,
+            runAlongsideOtherSessions: true
+        )
+        XCTAssertNil(message, "Consent is recorded; the blocker is shown in the banner")
+        let blocked = await Support.eventually {
+            scheduler.recoveryBlocker(scheduleID: scheduleID)?.interruptedSessionIDs == [held.session.id]
+        }
+        XCTAssertTrue(blocked, "\(scheduler.disposition(scheduleID: scheduleID))")
+        XCTAssertEqual(starts.count, 0)
+
+        // Check confirms the hold; just before its acknowledgement write, nothing has been sent.
+        final class Paused {
+            var startsBeforeCommit: Int?
+        }
+        let paused = Paused()
+        coordinator.test_crashHoldProofAtCommit = { [scheduler, starts, paused] in
+            scheduler.recordDidChange()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            paused.startsBeforeCommit = starts.count
+        }
+        let crash = try XCTUnwrap(coordinator.catalog.items.first { $0.sessionID == held.session.id && $0.kind == .crashHold })
+        let status = await coordinator.checkCatalogItems([crash], checksActive: true) { _ in
+            XCTFail("a crash hold is never reconciled")
+            return .notAttempted("no reconcile")
+        }
+        XCTAssertEqual(paused.startsBeforeCommit, 0, "the authorized send waits for the acknowledgement commit")
+        XCTAssertEqual(status?.entries.first?.outcome, .resolved(AgentRecoveryCrashHoldCheckText.confirmed))
+        let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
+        XCTAssertNotNil(acknowledgement)
+        XCTAssertNil(coordinator.lane(for: held.session.id), "the held session was never opened")
+
+        // After the commit: the consented message is sent exactly once.
+        let sent = await Support.eventually { starts.count == 1 }
+        XCTAssertTrue(sent, "\(scheduler.disposition(scheduleID: scheduleID))")
+        XCTAssertNil(scheduler.recoveryBlocker(scheduleID: scheduleID))
+        scheduler.recordDidChange()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(starts.count, 1, "Exactly one dispatch")
+    }
+
     /// Review A F09: recorded outcomes are worded without unsupported timing claims, and a failed or
     /// cancelled run is never presented as completed.
     func testRecoveredRunWordingStatesOnlyWhatTheEvidenceEstablishes() {

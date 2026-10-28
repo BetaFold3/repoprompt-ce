@@ -88,7 +88,9 @@ package extension AgentRecoverySessionLane {
                 processRunID: parentProcessRunID,
                 transcriptTurnID: nil,
                 processRunAssociation: .keepExisting,
-                providerKindRaw: parentOwnership.providerKindRaw
+                providerKindRaw: parentOwnership.providerKindRaw,
+                // A child link never precedes the parent run's first provider write: no mark.
+                runtimeRegistrationRaw: nil
             )
             return try await store.commitDelegatedChildLink(binding: binding, link: link)
         }

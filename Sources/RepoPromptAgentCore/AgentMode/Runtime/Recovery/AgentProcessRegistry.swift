@@ -151,6 +151,60 @@ package actor AgentProcessRegistry {
         )
     }
 
+    /// Step 9-activation-b: whether process records prove that nothing an earlier launch started for
+    /// `query`'s session can still be running, and that each held run attempt was registered there.
+    /// Current-instance records are this launch's own processes (a Codex Reconcile, for example,
+    /// associates the held attempt in this launch): they neither block nor count. An earlier-launch
+    /// record whose classification could not be persisted counts as not exited.
+    package func crashHoldExitProof(_ query: AgentRuntimeCrashHoldExitQuery) -> AgentRuntimeCrashHoldExitProof {
+        let current = store.appInstanceID
+        guard hasStarted, storageFailure == nil, current == query.currentAppInstanceID,
+              unidentifiedPreservedCount == 0, !preserved.values.contains(where: { $0 == nil })
+        else { return .ownershipUncertain }
+        let earlier = records.values.filter { $0.appInstanceID != current }
+        // What the session touches: the caller's keys plus, for every record (any launch) with an
+        // association naming this session (any incarnation), that association's keys and the
+        // record's own conversations and worktrees (keys set at reservation, before an association
+        // carried them).
+        var conversations = query.conversationIDs
+        var worktrees = query.worktreePaths
+        for record in records.values {
+            let naming = record.associations.filter { $0.session?.sessionID == query.sessionID }
+            guard !naming.isEmpty else { continue }
+            conversations.formUnion(naming.compactMap(\.conversationID) + record.conversationIDs)
+            worktrees.append(contentsOf: naming.compactMap(\.worktreePath) + record.worktreePaths)
+        }
+        func touchesSession(conversationIDs: [String], worktreePaths: [String]) -> Bool {
+            conversationIDs.contains(where: conversations.contains)
+                || worktreePaths.contains { path in worktrees.contains { AgentRuntimePaths.overlap($0, path) } }
+        }
+        // An unreadable record naming the session or what it touches: its state is unknowable.
+        let unreadableTouchesSession = preserved.values.compactMap(\.self).contains { bindings in
+            bindings.sessionIDs.contains(query.sessionID)
+                || touchesSession(conversationIDs: bindings.conversationIDs, worktreePaths: bindings.worktreePaths)
+        }
+        if unreadableTouchesSession { return .ownershipUncertain }
+        for record in earlier {
+            let terminal = (record.state == .exited || record.state == .stopped) && !unpersisted.contains(record.runtimeID)
+            guard !terminal else { continue }
+            let relevant = record.associations.isEmpty
+                || record.associations.contains { $0.session == nil || $0.session?.sessionID == query.sessionID }
+                || touchesSession(conversationIDs: record.conversationIDs, worktreePaths: record.worktreePaths)
+            if relevant { return .mayBeRunning }
+        }
+        for runAttemptID in query.runAttemptIDs {
+            let named = earlier.contains { record in
+                record.associations.contains {
+                    $0.session?.sessionID == query.sessionID
+                        && $0.session?.incarnationID == query.incarnationID
+                        && $0.session?.runAttemptID == runAttemptID
+                }
+            }
+            if !named { return .runNotRecorded }
+        }
+        return .proven
+    }
+
     private static func restriction(
         for record: AgentRuntimeRecord,
         kind: AgentRuntimeRestriction.Kind,
