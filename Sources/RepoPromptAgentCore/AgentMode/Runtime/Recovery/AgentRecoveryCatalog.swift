@@ -308,6 +308,7 @@ package enum AgentRecoveryCatalogProjection {
         builder.addSchedules(schedules)
         builder.addUnavailableScheduleIndexes(unavailableScheduleIndexes)
         builder.addRuntimeRestrictions()
+        builder.removeDeletedSessions()
         return AgentRecoveryCatalog(generation: generation, items: builder.items, blockers: builder.blockers)
     }
 
@@ -488,6 +489,24 @@ package enum AgentRecoveryCatalogProjection {
                 acknowledgement: acknowledgement,
                 actionFacts: facts
             ))
+        }
+
+        /// F8: a deleted session's items go with it. Startup rows come from the launch's
+        /// reconciliation snapshot (never re-run), so a live absent record alone would leave its
+        /// crash hold, run cards and status rows listed until the next launch. Surviving-process
+        /// items always stay, whatever session they name: deleting a session neither stops its
+        /// process nor lifts its runtime restriction (the registry's, which deletion never touches;
+        /// the blocker cleared here is the session's crash hold), and the item is the only place
+        /// to act on it.
+        mutating func removeDeletedSessions() {
+            let deleted = coordinator.deletedSessionIDs
+            guard !deleted.isEmpty else { return }
+            items.removeAll { item in
+                item.kind != .survivingProcess && (item.sessionID.map(deleted.contains) ?? false)
+            }
+            for sessionID in deleted {
+                blockers[sessionID] = nil
+            }
         }
 
         func currentRecord(sessionID: UUID, startup: AgentRecoveryRecord?, incarnationID: UUID) -> AgentRecoveryRecord? {

@@ -3578,4 +3578,232 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             return XCTFail("a tombstoned session never admits, got \(refused)")
         }
     }
+
+    /// A session whose earlier launch crashed mid-dispatch: on relaunch it has a crash hold, its
+    /// card and its run's rows, all from the startup snapshot.
+    private func makeSessionCrashedInAnEarlierLaunch() async throws -> AgentSessionEditableLoad {
+        let previousStore = makeStore(instance: UUID())
+        let previousService = makeService(store: previousStore)
+        let load = try await makeSession(previousService)
+        let previousGate = try previousService.recoveryLifecycleGate(for: load.persistenceState)
+        let ownership = Support.ownership(sessionID: load.session.id)
+        try await previousGate.performRecoveryTransaction {
+            _ = try await previousStore.ensureRunAttempt(
+                binding: previousGate.binding, expectedRevision: nil, ownership: ownership,
+                processRunID: nil, transcriptTurnID: nil,
+                providerKindRaw: nil
+            )
+            _ = try await previousStore.commitDispatchingIntent(
+                binding: previousGate.binding,
+                expectedRevision: previousStore.currentRevision(sessionID: load.session.id),
+                submission: Support.submission("in flight at crash"),
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: ownership.attemptID),
+                consumption: nil
+            )
+        }
+        return load
+    }
+
+    /// Counts one notification posted by one object (delivered on the posting thread).
+    private final class NotificationCount: @unchecked Sendable {
+        private(set) var value = 0
+        private var token: (any NSObjectProtocol)?
+
+        init(_ name: Notification.Name, object: AnyObject) {
+            token = NotificationCenter.default.addObserver(forName: name, object: object, queue: nil) { [weak self] _ in
+                self?.value += 1
+            }
+        }
+
+        deinit {
+            if let token { NotificationCenter.default.removeObserver(token) }
+        }
+    }
+
+    /// Delivers every catalog-change post already scheduled before counting starts. Posts are
+    /// coalesced, so one more invalidation joins any pending post; its delivery shows none is left.
+    private func drainCatalogChanges(_ coordinator: AgentRecoveryCoordinator) async {
+        let drained = NotificationCount(.agentRecoveryCatalogDidChange, object: coordinator)
+        coordinator.invalidateCatalog()
+        let delivered = await Support.eventually { drained.value >= 1 }
+        XCTAssertTrue(delivered, "a pending catalog-change post never ran")
+    }
+
+    /// Once the awaited notification arrived, lets a later one land before an exact count is
+    /// asserted (only the upper bound depends on it).
+    private func settle() async throws {
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    /// F8: deleting a session takes its Needs Attention items out of the open app's catalog at once
+    /// (every window and the badge read it), including the rows built from this launch's startup
+    /// snapshot, and its crash hold no longer pauses its workspace's other sessions.
+    func testDeletedSessionLeavesTheCatalogAndReleasesItsCrashHold() async throws {
+        let load = try await makeSessionCrashedInAnEarlierLaunch()
+        let otherSessionID = UUID()
+        let store = makeStore(instance: UUID())
+        let service = makeService(store: store)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let sessionID = load.session.id
+        XCTAssertNotNil(coordinator.crashHold(for: sessionID))
+        XCTAssertEqual(coordinator.catalog.blockers[sessionID], .crashHold)
+        XCTAssertTrue(coordinator.catalog.items.contains { $0.sessionID == sessionID && $0.id == "crash-\(sessionID.uuidString)" })
+        XCTAssertGreaterThan(coordinator.catalog.openNeedsActionCount, 0)
+        XCTAssertTrue(coordinator.hasUnresolvedSession(inWorkspace: workspace.id, excluding: otherSessionID))
+        await drainCatalogChanges(coordinator)
+        let coordinatorChanges = NotificationCount(.agentRecoveryCoordinatorDidChange, object: coordinator)
+        let catalogChanges = NotificationCount(.agentRecoveryCatalogDidChange, object: coordinator)
+
+        try await service.deleteAgentSession(id: sessionID, for: workspace)
+
+        let removed = await Support.eventually {
+            !coordinator.catalog.items.contains { $0.sessionID == sessionID }
+        }
+        XCTAssertTrue(removed, "\(coordinator.catalog.items.map(\.id))")
+        XCTAssertTrue(coordinator.deletedSessionIDs.contains(sessionID))
+        XCTAssertEqual(coordinator.catalog.openNeedsActionCount, 0, "the badge no longer counts them")
+        XCTAssertTrue(coordinator.catalog.needsAttentionItems(includeDismissed: true).isEmpty)
+        XCTAssertNil(coordinator.catalog.blockers[sessionID])
+        XCTAssertNil(coordinator.crashHold(for: sessionID))
+        XCTAssertFalse(coordinator.hasUnresolvedSession(inWorkspace: workspace.id, excluding: otherSessionID))
+        XCTAssertTrue(coordinator.unresolvedSessionSummary(inWorkspace: workspace.id, excluding: otherSessionID).isEmpty)
+        // Windows and the badge are told: one coordinator change for the deletion; the catalog
+        // change is coalesced, and this deletion's record removal may add at most one more.
+        let announced = await Support.eventually { catalogChanges.value >= 1 }
+        XCTAssertTrue(announced)
+        try await settle()
+        XCTAssertEqual(coordinatorChanges.value, 1)
+        XCTAssertTrue((1 ... 2).contains(catalogChanges.value), "\(catalogChanges.value)")
+
+        // The next launch agrees: the tombstone retires the session.
+        let nextStore = makeStore(instance: UUID())
+        let nextCoordinator = try await startedCoordinator(store: nextStore, service: makeService(store: nextStore))
+        XCTAssertFalse(nextCoordinator.catalog.items.contains { $0.sessionID == sessionID })
+        XCTAssertNil(nextCoordinator.crashHold(for: sessionID))
+    }
+
+    /// F8: an unreadable record is preserved on deletion and publishes no record commit; the
+    /// tombstone alone takes its status row and session restriction away, announcing it once.
+    func testDeletedSessionWithAnUnreadableRecordLeavesTheCatalog() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let sessionID = load.session.id
+        let recordURL = store.recordFileURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: recordURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not a recovery record".utf8).write(to: recordURL)
+
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let statusItemID = "status-\(sessionID.uuidString)"
+        XCTAssertNotNil(coordinator.catalog.item(id: statusItemID), "\(coordinator.catalog.items.map(\.id))")
+        XCTAssertNotNil(coordinator.restrictions.sessionRestriction(sessionID))
+        await drainCatalogChanges(coordinator)
+        let coordinatorChanges = NotificationCount(.agentRecoveryCoordinatorDidChange, object: coordinator)
+        let catalogChanges = NotificationCount(.agentRecoveryCatalogDidChange, object: coordinator)
+
+        try await service.deleteAgentSession(id: sessionID, for: workspace)
+
+        let removed = await Support.eventually { coordinator.catalog.item(id: statusItemID) == nil }
+        XCTAssertTrue(removed)
+        XCTAssertFalse(coordinator.catalog.items.contains { $0.sessionID == sessionID })
+        XCTAssertNil(coordinator.restrictions.sessionRestriction(sessionID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recordURL.path), "unreadable bytes are preserved")
+        let announced = await Support.eventually { catalogChanges.value >= 1 }
+        XCTAssertTrue(announced)
+        try await settle()
+        XCTAssertEqual(coordinatorChanges.value, 1)
+        XCTAssertEqual(catalogChanges.value, 1, "windows and the badge are told once")
+
+        // A repeated note of the same deletion changes and announces nothing.
+        coordinator.noteSessionDeleted(sessionID)
+        try await settle()
+        XCTAssertEqual(coordinatorChanges.value, 1)
+        XCTAssertEqual(catalogChanges.value, 1)
+    }
+
+    /// F8: a deletion noted while startup is still loading, after the sweep read the session and
+    /// before startup publishes, leaves no crash hold, restriction or item once startup is ready.
+    func testSessionDeletedWhileStartupIsLoadingStaysRetired() async throws {
+        let load = try await makeSessionCrashedInAnEarlierLaunch()
+        let sessionID = load.session.id
+        let store = makeStore(instance: UUID())
+        let service = makeService(store: store)
+        let probe = ReconcileProbe()
+        probe.suspends = true
+        let destination = AgentRecoveryWorkspaceDestination(
+            id: workspace.id,
+            name: workspace.name,
+            customStoragePath: workspace.customStoragePath
+        )
+        let coordinator = try AgentRecoveryCoordinator(
+            store: store,
+            dataService: service,
+            reconcile: { report in
+                // The sweep reads the session before the deletion; startup publishes after it.
+                let results = await AgentRecoveryStartupSweep.run(
+                    inventory: AgentRecoveryWorkspaceInventory(workspaces: [destination]),
+                    entries: report.discovered,
+                    dataService: service
+                )
+                try await probe.run(report)
+                return results
+            }
+        )
+        coordinator.startIfNeeded()
+        await probe.waitUntilSuspended()
+        XCTAssertEqual(coordinator.startupState, .loading)
+
+        try await service.deleteAgentSession(id: sessionID, for: workspace)
+        let noted = await Support.eventually { coordinator.deletedSessionIDs.contains(sessionID) }
+        XCTAssertTrue(noted)
+        probe.release()
+        let state = await coordinator.awaitStartup()
+        XCTAssertEqual(state, .ready)
+
+        XCTAssertNotNil(coordinator.startupReport?.crashHolds[sessionID], "the sweep saw the session before its deletion")
+        XCTAssertNil(coordinator.crashHold(for: sessionID))
+        XCTAssertNil(coordinator.restrictions.sessionRestriction(sessionID))
+        XCTAssertFalse(coordinator.catalog.items.contains { $0.sessionID == sessionID }, "\(coordinator.catalog.items.map(\.id))")
+        XCTAssertNil(coordinator.catalog.blockers[sessionID])
+        XCTAssertFalse(coordinator.hasUnresolvedSession(inWorkspace: workspace.id, excluding: UUID()))
+    }
+
+    /// F8 / review B VF-8: a deleted session's ownerless unsaved input can never be saved or
+    /// restored, and its row is gone, so quit no longer refuses over it.
+    func testDeletedSessionNoLongerHoldsQuitOverItsUnsavedInput() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let sessionID = load.session.id
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        _ = await lane.restoreComposer()
+        failures.shouldFailWrites = true
+        lane.composerDidChange(Support.content("unsaved when the tab closed"))
+        await coordinator.releaseLane(lane).value
+        failures.shouldFailWrites = false
+        XCTAssertNotNil(coordinator.ownerlessUnsavedInputs[sessionID])
+        let unsavedBefore = await coordinator.settleReleasedRetirements()
+        XCTAssertTrue(unsavedBefore.contains(sessionID))
+        await drainCatalogChanges(coordinator)
+        let coordinatorChanges = NotificationCount(.agentRecoveryCoordinatorDidChange, object: coordinator)
+        let composerChanges = NotificationCount(.agentRecoveryComposerStateDidChange, object: coordinator)
+        let catalogChanges = NotificationCount(.agentRecoveryCatalogDidChange, object: coordinator)
+
+        coordinator.noteSessionDeleted(sessionID)
+
+        XCTAssertNil(coordinator.ownerlessUnsavedInputs[sessionID])
+        // Review B VF-R1-7: the deletion is announced once to each kind of observer; the composer
+        // change (the session's composer state) is a separate notification, not a second
+        // coordinator change, and the catalog change is coalesced.
+        let announced = await Support.eventually { catalogChanges.value >= 1 }
+        XCTAssertTrue(announced)
+        try await settle()
+        XCTAssertEqual(coordinatorChanges.value, 1)
+        XCTAssertEqual(composerChanges.value, 1)
+        XCTAssertEqual(catalogChanges.value, 1)
+        let unsavedAfter = await coordinator.settleReleasedRetirements()
+        XCTAssertFalse(unsavedAfter.contains(sessionID))
+        XCTAssertFalse(coordinator.catalog.items.contains { $0.sessionID == sessionID })
+    }
 }

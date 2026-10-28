@@ -121,6 +121,11 @@ struct AgentRecoveryNeedsAttentionSheet: View {
         }
         .padding(20)
         .frame(minWidth: 620, minHeight: 400)
+        // A row's View opens beside the sheet, over the inert window behind, never over another row.
+        .agentRecoveryNativePopoverRegion(edge: .trailing)
+        // A container element, so the sheet's identifier names the sheet itself instead of being
+        // applied to the elements inside it (the check report kept only `…sheet`).
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("agent.recoveryNeedsAttention.sheet")
         .confirmationDialog(
             Self.needsActionConfirmationTitle(

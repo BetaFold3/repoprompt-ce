@@ -46,6 +46,11 @@ struct AgentRecoveryListBanner: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(Color.orange.opacity(0.35), lineWidth: 0.5)
         )
+        // A row's View opens above the banner, over the transcript, never over another row.
+        .agentRecoveryNativePopoverRegion(edge: .top)
+        // A container element, so the banner's identifier names the banner itself instead of being
+        // applied to the elements inside it.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("agent.recoveryList.banner")
     }
 
@@ -120,6 +125,7 @@ struct AgentRecoveryListRow: View {
             if row.text != nil || !row.attachmentNames.isEmpty {
                 Button("View") { isViewing = true }
                     // Native NSPopover: the outside click that closes it still reaches its target.
+                    // It opens outside the banner or sheet (its region), never over another row.
                     .agentRecoveryNativePopover(isPresented: $isViewing, arrowEdge: .top) {
                         AgentRecoveryRowViewer(row: row, inspect: actions.inspect)
                     }

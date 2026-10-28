@@ -30,9 +30,83 @@ enum AgentRecoveryNativePopoverEventDecision: Equatable {
     }
 }
 
+/// The container of recovery rows (banner or Needs Attention sheet) that row popovers open outside
+/// of, so a row's View popover never covers another row's buttons. Rows put their buttons at the
+/// trailing edge and their widths vary (a run card's can be most of the row), so any placement over
+/// the rows' width can land on some row's buttons.
+@MainActor
+final class AgentRecoveryNativePopoverRegion {
+    fileprivate weak var view: NSView?
+    fileprivate var edge: NSRectEdge = .maxY
+
+    /// Where a row's popover is shown.
+    enum Placement: Equatable {
+        /// Against the whole region, on this edge. `preferredEdge` is only a preference to AppKit,
+        /// but every edge of the region's own rect is outside the region, so no row is covered.
+        case region(NSRectEdge)
+        /// Against the View button, as before regions existed: no side of the region has room on
+        /// the screen. The popover may then cover other rows.
+        case anchor
+    }
+
+    /// Room the popover needs beyond its content size (arrow and border).
+    nonisolated static let popoverChrome: CGFloat = 24
+
+    /// The first edge of the region with room on the screen's visible frame for the popover beyond
+    /// it: the preferred edge, its opposite, then the two edges at right angles to it (a sheet
+    /// hangs from the title bar, so below it usually has room; a banner may have room beside it).
+    /// The anchor only when no side has room. All rects are in screen coordinates.
+    nonisolated static func placement(
+        region: NSRect,
+        popover: NSSize,
+        visibleFrame: NSRect,
+        preferredEdge: NSRectEdge
+    ) -> Placement {
+        for edge in [preferredEdge, opposite(of: preferredEdge)] + rightAngles(to: preferredEdge) {
+            let isVertical = edge == .minY || edge == .maxY
+            let needed = (isVertical ? popover.height : popover.width) + popoverChrome
+            if room(beyond: edge, of: region, in: visibleFrame) >= needed {
+                return .region(edge)
+            }
+        }
+        return .anchor
+    }
+
+    private nonisolated static func opposite(of edge: NSRectEdge) -> NSRectEdge {
+        if edge == .minX { return .maxX }
+        if edge == .maxX { return .minX }
+        if edge == .minY { return .maxY }
+        return .minY
+    }
+
+    /// Below then above a horizontal edge; trailing then leading beside a vertical one.
+    private nonisolated static func rightAngles(to edge: NSRectEdge) -> [NSRectEdge] {
+        edge == .minY || edge == .maxY ? [.maxX, .minX] : [.minY, .maxY]
+    }
+
+    private nonisolated static func room(beyond edge: NSRectEdge, of region: NSRect, in visibleFrame: NSRect) -> CGFloat {
+        if edge == .minX { return region.minX - visibleFrame.minX }
+        if edge == .maxX { return visibleFrame.maxX - region.maxX }
+        if edge == .minY { return region.minY - visibleFrame.minY }
+        return visibleFrame.maxY - region.maxY
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var agentRecoveryNativePopoverRegion: AgentRecoveryNativePopoverRegion? = nil
+}
+
 extension View {
+    /// Marks this view as the region that `agentRecoveryNativePopover`s inside it open outside of,
+    /// on `edge` (the banner: above it, over the transcript; the sheet: beside it, over the inert
+    /// window behind).
+    func agentRecoveryNativePopoverRegion(edge: Edge) -> some View {
+        modifier(AgentRecoveryNativePopoverRegionModifier(edge: edge))
+    }
+
     /// An AppKit `NSPopover` anchored to this view, hosting `content` in SwiftUI. Unlike `.popover`,
-    /// the outside click that dismisses it still reaches what was clicked.
+    /// the outside click that dismisses it still reaches what was clicked. Inside an
+    /// `agentRecoveryNativePopoverRegion` it opens outside that region; otherwise on `arrowEdge`.
     func agentRecoveryNativePopover(
         isPresented: Binding<Bool>,
         arrowEdge: Edge,
@@ -41,6 +115,42 @@ extension View {
         background(
             AgentRecoveryNativePopoverAnchor(isPresented: isPresented, arrowEdge: arrowEdge, content: content)
         )
+    }
+}
+
+private struct AgentRecoveryNativePopoverRegionModifier: ViewModifier {
+    let edge: Edge
+    @State private var region = AgentRecoveryNativePopoverRegion()
+
+    func body(content: Content) -> some View {
+        content
+            .background(AgentRecoveryNativePopoverRegionMarker(region: region, edge: edge))
+            .environment(\.agentRecoveryNativePopoverRegion, region)
+    }
+}
+
+/// An unflipped `NSView` filling the region, so popovers can be positioned relative to it.
+private struct AgentRecoveryNativePopoverRegionMarker: NSViewRepresentable {
+    let region: AgentRecoveryNativePopoverRegion
+    let edge: Edge
+
+    func makeNSView(context _: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context _: Context) {
+        region.view = nsView
+        region.edge = rectEdge(for: edge)
+    }
+}
+
+/// The `NSView`s here are unflipped, so the top edge is `maxY`.
+private func rectEdge(for edge: Edge) -> NSRectEdge {
+    switch edge {
+    case .top: .maxY
+    case .bottom: .minY
+    case .leading: .minX
+    case .trailing: .maxX
     }
 }
 
@@ -60,8 +170,9 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.update(
             anchor: nsView,
+            region: context.environment.agentRecoveryNativePopoverRegion,
             isPresented: $isPresented,
-            preferredEdge: Self.rectEdge(for: arrowEdge),
+            preferredEdge: rectEdge(for: arrowEdge),
             content: content
         )
     }
@@ -70,16 +181,6 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
         // Never write the binding mid-update; reset it afterwards so a View button that comes back
         // doesn't start with a stale `true` (which would make it look dead).
         coordinator.close(reportingClosed: .deferred)
-    }
-
-    /// The anchor `NSView` is unflipped, so the top edge is `maxY`.
-    private static func rectEdge(for edge: Edge) -> NSRectEdge {
-        switch edge {
-        case .top: .maxY
-        case .bottom: .minY
-        case .leading: .minX
-        case .trailing: .maxX
-        }
     }
 
     @MainActor
@@ -97,15 +198,18 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
         private var eventMonitor: Any?
         private var resignActiveObserver: NSObjectProtocol?
         private weak var anchor: NSView?
+        private weak var region: AgentRecoveryNativePopoverRegion?
         private var isPresented: Binding<Bool>?
 
         func update(
             anchor: NSView,
+            region: AgentRecoveryNativePopoverRegion?,
             isPresented: Binding<Bool>,
             preferredEdge: NSRectEdge,
             content: () -> PopoverContent
         ) {
             self.anchor = anchor
+            self.region = region
             self.isPresented = isPresented
             if isPresented.wrappedValue {
                 if let host {
@@ -134,7 +238,25 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             self.host = host
             self.popover = popover
             installMonitors()
-            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: preferredEdge)
+            // Outside the rows' region when there is one and the screen has room beside it: shown
+            // against the whole region, so whichever edge AppKit settles on stays outside it (the
+            // arrow then points at the region's edge, and the popover stays put if the rows scroll).
+            // The anchor itself still toggles it.
+            if let region, let regionView = region.view, let window = regionView.window, window === anchor.window,
+               let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame,
+               case let .region(edge) = AgentRecoveryNativePopoverRegion.placement(
+                   region: window.convertToScreen(regionView.convert(regionView.bounds, to: nil)),
+                   popover: host.view.fittingSize,
+                   visibleFrame: visibleFrame,
+                   preferredEdge: region.edge
+               )
+            {
+                popover.show(relativeTo: regionView.bounds, of: regionView, preferredEdge: edge)
+            } else {
+                // No region, or no room on either side of it: next to the View button, as before.
+                // The popover may then cover other rows.
+                popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: preferredEdge)
+            }
         }
 
         /// Closes the popover (if shown) and reports it closed through the binding. Idempotent.

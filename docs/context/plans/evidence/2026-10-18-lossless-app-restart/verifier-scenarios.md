@@ -16,21 +16,21 @@ Covers: scenarios the external verifier (Pi in Terminal, using rpce-cli-debug an
 
 ## Housekeeping (before the first scenario, owner approval)
 
-H1. Delete the 14 leftover synthetic sessions from the earlier live run through the UI. The main agent holds the list (titles T2–T14, "Restart acceptance M: 600s foreground wait", RPCE_RESTART_ACCEPTANCE_20261025_Z). Pass: they disappear from the sidebar and their Needs Attention items go with them.
+H1. Delete the 14 leftover synthetic sessions from the earlier live run through the UI. The main agent holds the list (titles T2–T14, "Restart acceptance M: 600s foreground wait", RPCE_RESTART_ACCEPTANCE_20261025_Z). Pass: they disappear from the sidebar and their Needs Attention items go with them at once, without a relaunch: in every open window the banner and sheet drop their rows and the sidebar badge (`agent.recoveryNeedsAttention.sidebarButton`) stops counting them (F8 re-check).
 
 ## Step 8-popover (no kill)
 
-P1. On a row with a View button, open View; with it open, click Edit (or Remove / Restore / Discard…) once. Pass: popover closes and the button acts on the same click.
+P1. On a row with a View button, open View; with it open, click Edit (or Remove / Restore / Discard…) once. Pass: popover closes and the button acts on the same click. Overlap re-check: with two or three banner rows, open View on the lowest one. Pass: the popover opens above the banner, over the transcript, and covers no row or header button; one click on a button of a row above it closes View and acts.
 P2. Open View, click once in the composer. Pass: closes and the composer has focus; typing works at once.
 P3. Open View, click a sidebar session or toolbar button once. Pass: closes and that item activates.
 P4. Open View, click View again. Pass: closes and stays closed; a third click reopens.
 P5. Open View, press Escape right away without clicking inside. Pass: closes. (If not, report; this is a known open question.)
 P6. On an edit-proposal row: open View, wait for the comparison line to change from "Comparing with the current file…", close, reopen. Pass: the result appears on the first open and is recomputed on the second, never stuck or stale.
-P7. Same as P1 from the Needs Attention sheet. Pass: same as P1.
+P7. Same as P1 from the Needs Attention sheet. Pass: same as P1, except that the popover opens beside the sheet, over the window behind it, and covers no row or sheet button; one click on any other row's button closes View and acts.
 P8. With View open, click a control in another RepoPrompt window once. Pass: the popover closes and that window activates; normal macOS first-click rules apply there (a second click may be needed), and nothing else changes focus.
 P9. Cmd-Tab away with View open, come back, click View once. Pass: it had closed; reopens with one click.
 P10. Open View, then remove that row while it is open (act on it from the sheet or another window); when a row with a View button appears again, click View once. Pass: the popover went away with the row, and View opens with one click (never looks dead).
-P11. Open View inside the Needs Attention sheet, then click the window behind the sheet. Pass: the popover closes; keyboard focus does not land in the composer behind the still-open sheet.
+P11. Open View inside the Needs Attention sheet, then click the window behind the sheet, outside the popover. Pass: the popover closes; keyboard focus does not land in the composer behind the still-open sheet.
 
 ## Step 8-attention (no kill unless marked)
 
@@ -50,7 +50,7 @@ A11. Close the sheet after a finished bulk and reopen it. Pass: the old summary 
 
 C1. Before activation: run Check and resolve on existing items. Pass: report says process and provider-history checks are not active; nothing is resolved automatically; no session is opened; no message is sent.
 C2. Kill/relaunch, after activation: mixed state (one Claude process still running a long tool, one Codex run that finished while closed, one unsent saved message, one pending question). Open the finished Codex session in a window, then run Check (`agent.recoveryNeedsAttention.check`) from that window. Pass: report (`agent.recoveryNeedsAttention.checkReport`) shows a "Refreshing process ownership…" phase first and warns that clearing a restriction may let already-authorized scheduled sends run; running process → "needs you" (Let it finish or Stop); finished Codex run → resolved via history; run cards of sessions not open in that window → "Open this session to check its provider history."; unsent message → "needs you"; question → "needs you"; nothing sent; run-attempt counts unchanged.
-C3. Cancel a running Check part-way. Pass: completed items stay completed; remaining items untouched; the report says cancelled.
+C3. Click Stop on a running Check part-way. Pass: completed items stay completed; remaining items untouched; the report says cancelled.
 
 ## Step 9-activation (Claude Code = C, Codex = X)
 

@@ -371,6 +371,44 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
         XCTAssertFalse(coordinator.runtimeBlocksAutomaticWork(sessionID: other.sessionID))
     }
 
+    /// F8 / review B VF-R1-2: deleting a session neither removes the item of a process that
+    /// outlived it nor lifts that process's restriction. The registry owns both; deletion retires
+    /// only the session's startup crash hold and startup restriction.
+    func testDeletingASessionKeepsItsSurvivingProcessAndItsRestriction() async throws {
+        processes.add(processes.observation(pid: 5800, group: 5800))
+        let lifecycle = AgentRecoveryLifecycleBinding(sessionID: UUID(), incarnationID: UUID(), transcriptResetGeneration: 0)
+        let writer = try Fixtures.seed(
+            rootURL: recoveryRoot,
+            root: processes.identity(pid: 5800),
+            rootGroup: 5800,
+            associations: [AgentRuntimeAssociation(
+                session: AgentRuntimeSessionAssociation(lifecycle: lifecycle, runAttemptID: UUID(), processRunID: nil),
+                conversationID: "conv-D",
+                worktreePath: "/tmp/wt-d",
+                permission: .claude(permissionMode: "default")
+            )],
+            conversationIDs: ["conv-D"],
+            worktreePaths: ["/tmp/wt-d"]
+        )
+        let coordinator = try await startedCoordinator()
+        keysBySession[lifecycle.sessionID] = [AgentRuntimeOwnershipKeys(conversationID: "conv-D", worktreePath: "/tmp/wt-d")]
+        let neighbour = session(conversationID: "conv-N", worktreePath: "/tmp/wt-d")
+        let itemID = AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: writer.runtimeID)
+        XCTAssertNotNil(coordinator.catalog.item(id: itemID))
+        let restrictions = coordinator.runtimeRestrictions
+        XCTAssertEqual(restrictions.restrictions.map(\.runtimeID), [writer.runtimeID])
+
+        coordinator.noteSessionDeleted(lifecycle.sessionID)
+
+        XCTAssertTrue(coordinator.deletedSessionIDs.contains(lifecycle.sessionID))
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID), "the surviving process stays listed")
+        XCTAssertEqual(item.kind, .survivingProcess)
+        XCTAssertEqual(coordinator.runtimeRestrictions, restrictions, "the process's restriction stays in force")
+        XCTAssertEqual(coordinator.runtimeSendRestriction(sessionID: lifecycle.sessionID)?.runtimeID, writer.runtimeID)
+        XCTAssertTrue(coordinator.runtimeBlocksAutomaticWork(worktreePath: "/tmp/wt-d"), "new sessions on its worktree stay paused")
+        XCTAssertTrue(coordinator.runtimeBlocksAutomaticWork(sessionID: neighbour.sessionID), "its worktree stays busy for automatic work")
+    }
+
     func testWithoutAnAttachedRegistryNothingIsRuntimeRestricted() async throws {
         try seedWriter(pid: 5400, conversationID: "conv-X", worktreePath: "/tmp/wt-x")
         let coordinator = try await startedCoordinator(attachRegistry: false)

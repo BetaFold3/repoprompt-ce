@@ -482,6 +482,11 @@ package final class AgentRecoveryCoordinator {
     /// Latest committed record state per session published by the store since composition (live
     /// overlay of the startup snapshot; `reconciliation` itself is never re-run per write).
     private var liveRecordCommits: [UUID: AgentRecoveryRecordCommit] = [:]
+    /// Sessions whose deletion committed (tombstone) since composition. A tombstone retires its
+    /// session for good, so nothing of it is listed or held again; the next launch's reconciliation
+    /// classifies it `.tombstoned` (F8).
+    package private(set) var deletedSessionIDs: Set<UUID> = []
+    private var deletionObserver: (any NSObjectProtocol)?
     private var pendingRecordChangeSessionIDs: Set<UUID> = []
     private var recordChangePostScheduled = false
     private struct HeldIntentNotes {
@@ -570,6 +575,25 @@ package final class AgentRecoveryCoordinator {
                 self?.adoptRecordCommit(commit)
             }
         }
+        // Posted by `AgentSessionDataService` once per tombstone commit, before the session file and
+        // record are removed. A record that was absent or unreadable publishes no record commit, so
+        // the tombstone is the deletion signal.
+        deletionObserver = NotificationCenter.default.addObserver(
+            forName: .agentSessionDeletionDidCommit,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let sessionID = notification.userInfo?["sessionID"] as? UUID else { return }
+            MainActor.assumeIsolated {
+                self?.noteSessionDeleted(sessionID)
+            }
+        }
+    }
+
+    deinit {
+        if let deletionObserver {
+            NotificationCenter.default.removeObserver(deletionObserver)
+        }
     }
 
     // MARK: Live records
@@ -588,6 +612,31 @@ package final class AgentRecoveryCoordinator {
     /// Every live (unretired) lane.
     package var liveLanes: [AgentRecoverySessionLane] {
         lanes.values.filter { !$0.isRetired }
+    }
+
+    /// F8: a committed deletion takes the session's items out of the catalog (every window and the
+    /// badge) and drops its startup crash hold and session restriction, which would otherwise keep
+    /// pausing its workspace's other sessions until the next launch. Its held-intent notes, ownerless
+    /// unsaved input and released lane retirement go too: that input can never be saved or restored
+    /// again, and quit (`settleReleasedRetirements`) must not refuse over a row the catalog no longer
+    /// shows. A retirement still running then finds itself untracked and publishes nothing.
+    /// Idempotent.
+    package func noteSessionDeleted(_ sessionID: UUID) {
+        guard deletedSessionIDs.insert(sessionID).inserted else { return }
+        retireStartupState(ofDeletedSessions: [sessionID])
+        releasedRetirements[sessionID] = nil
+        let hadNotes = heldIntentNotes.removeValue(forKey: sessionID) != nil
+        let hadUnsaved = releasedUnsavedInputs.removeValue(forKey: sessionID) != nil
+        if hadNotes || hadUnsaved { composerStateDidChange(sessionID: sessionID) }
+        postCoordinatorDidChange()
+    }
+
+    private func retireStartupState(ofDeletedSessions sessionIDs: Set<UUID>) {
+        for sessionID in sessionIDs {
+            crashHolds[sessionID] = nil
+            confirmedCrashHolds[sessionID] = nil
+            restrictions.lift(sessionID: sessionID)
+        }
     }
 
     private func adoptRecordCommit(_ commit: AgentRecoveryRecordCommit) {
@@ -932,6 +981,8 @@ package final class AgentRecoveryCoordinator {
                     || hold.isCovered(by: results.resolution(for: sessionID)?.record?.record.crashHoldAcknowledgement)
             }
             restrictions = AgentRecoveryRestrictions.from(results)
+            // A deletion that committed while this startup was reading stays retired.
+            retireStartupState(ofDeletedSessions: deletedSessionIDs)
             startupReport = AgentRecoveryStartupReport(
                 previousLaunch: previous,
                 currentLaunch: current,
