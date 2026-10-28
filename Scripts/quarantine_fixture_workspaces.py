@@ -23,7 +23,13 @@ RepoPrompt XCTest bundle is running. There is no override. The app and its helpe
 quit for the whole run: the script re-checks processes and re-collects the hard-reference set
 at start, every 100 moves and at least every ~5 s, and stops cleanly (exit 3) if a process
 appears or the references change, but it cannot prevent a launch mid-run (an in-app maintenance
-lock is out of scope). An exclusive lock file <app-support>/.rpce-quarantine.lock prevents two
+lock is out of scope). After exit 3, quit whatever caused it and re-run --apply with the SAME
+manifest and the same --class values (C, P and S together): entries already moved are skipped
+because their origin is gone. Class P folders whose workspaces the stopped run had already moved
+then stay in Partitions/ (skipped as p_not_all_candidates); to move them as well, --restore the
+stopped run's journal first and then re-run --apply. On such a re-run, entries the stopped run
+already moved are expected as skipped revalidation:c_not_workspace_dir (C), :not_directory (P),
+:scan_failed (S) and :missing (A/B). An exclusive lock file <app-support>/.rpce-quarantine.lock prevents two
 --apply/--restore runs from overlapping.
 
 Candidate classes (a directory must match one exactly; everything else is kept):
@@ -33,9 +39,35 @@ Candidate classes (a directory must match one exactly; everything else is kept):
      the index is an empty AgentSessionMetadataIndex; nothing modified in the last 24 h.
   B  ephemeral fixture: as A, plus workspace.json with ephemeralFlag == true whose id/name
      reproduce the directory name; the empty index is optional. Needs separate approval.
+  C  non-empty fixture (Step 10b, owner decision O41), tried when A/B do not match: name group in
+     FIXTURE_NAME_GROUPS (names unit tests created); not referenced by workspacesIndex.json,
+     windowSessions.json, MCP routing or AgentRecovery, by workspace ID or by any session/chat
+     UUID in its file names; at most 64 entries, only files, dirs and relative symlinks without a
+     ".." component (they stay inside the dir and move with it), each file <= 2 MiB; no path
+     under the store owner's home except the prefixes in USER_PATH_EXEMPT; a fixture signal (no
+     workspace.json, ephemeralFlag true, or a workspace.json repoPaths entry under /var/folders);
+     a workspace.json, if any, is a regular file carrying the directory's id, isSystemWorkspace
+     false and no customStoragePath; nothing modified in the last 24 h. A Partitions reference
+     does not exclude it (see P). Needs a present, readable workspacesIndex.json.
+  P  <app-support>/Partitions/<repo-key> directory whose files are all filepartitions files of
+     class C candidates (never a directory that also holds another workspace's file) whose tab
+     UUIDs are unreferenced; nothing modified in the last 24 h. --apply moves it only when this
+     same invocation has just moved every one of its workspaces as class C, so --class P needs
+     --class C and a P-only run moves nothing.
+  S  <app-support>/windowSessions.json.sb-* leftover atomic-write file: regular file <= 4 KiB,
+     empty or a window-session document without windows, not modified in the last 24 h.
+
+--apply moves every class into the same flat quarantine directory and journals each entry's
+origin, so --restore returns Workspaces/, Partitions/ and app-support-root entries to where they
+were. The periodic reference re-check tracks Partitions file by file (repo folder + file name) and
+expects only the exact files of the class P folders this run has moved or restored to disappear or
+reappear; any other Partitions change stops the run.
+The home directory for the user-path rule is the app-support folder owner's; the run refuses unless
+it runs as that owner and that home is $HOME (sudo, another user, launchd, HOME override), and the
+manifest records it.
 
 Workspaces referenced by app state (workspacesIndex.json, windowSessions.json, MCP routing
-state, AgentRecovery/v1, Partitions) are always excluded. Settings/globalSettings.json
+state, AgentRecovery/v1, Partitions) are always excluded from A and B. Settings/globalSettings.json
 per-workspace maps are a soft reference: flagged and counted, not excluded. Any reference
 store that exists but is unreadable or has an unknown shape aborts the run (fail closed); a
 reference container (MCP, AgentRecovery, AgentRecovery/v1/*, Partitions, Settings) that exists
@@ -51,6 +83,7 @@ import errno
 import fcntl
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -73,7 +106,7 @@ UUID_ANY_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa
 NAME_GROUP_SUFFIX_RE = re.compile(r"[ -][0-9A-Fa-f]{8}$")
 PARTITION_FILE_RE = re.compile(
     r"^filepartitions-([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})"
-    r"(?:-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})?\.json$"
+    r"(?:-([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}))?\.json$"
 )
 
 DIR_PREFIX = "Workspace-"  # WorkspaceDirectoryName.prefix
@@ -113,6 +146,80 @@ GLOBAL_SETTINGS_LINEAGE = "repoprompt-ce.global-settings"
 GLOBAL_SETTINGS_MAPS = ("copySettingsByWorkspaceID", "chatSettingsByWorkspaceID", "agentModelsSettingsByWorkspaceID")
 RECOVERY_V1_ENTRIES = {"launch-state.json", "sessions", "tombstones", "attachments"}
 IGNORABLE_NAMES = {".DS_Store"}
+
+# Class C name groups: every fixture workspace name group the Step 10b classification found in the
+# live store whose name also appears in Tests/ (2026-10-27, owner decision O41).
+FIXTURE_NAME_GROUPS = frozenset({
+    'Active Workspace',
+    'Agent Mode Chat Switch',
+    'Agent Run Worktree Start',
+    'Cleanup Origin',
+    'Code Structure Worktree',
+    'Context Builder OMP readiness',
+    'Context Builder follow-up timeline test',
+    'Cursor Parameter Metadata',
+    'D7 Deferral',
+    'Default',
+    'Delegation Boundary',
+    'Displayed Title',
+    'Distinct MCP Connection A',
+    'Distinct MCP Connection B',
+    'Explicit window overrides sticky binding',
+    'Fork Session',
+    'Lifecycle Contract',
+    'List Agents',
+    'List Sessions',
+    'Loaded workspace',
+    'Newer Canonical Selection',
+    'Next Readiness Target',
+    'OMP Public Start',
+    'OMP Qualification Authorized Failure',
+    'OMP Qualification Context Replacement',
+    'OMP Qualification Fence Replacement',
+    'OMP Qualification Fingerprinted',
+    'OMP Qualification Frozen Workspace',
+    'OMP Qualification Pre-Dispatch Replacement',
+    'OMP Qualification Single Deadline',
+    'OMP Qualification Start Wait',
+    'OMP Qualification Startup Reason',
+    'Owning Notice Target',
+    'Persistent Agent Mode MCP Read',
+    'Phase Target',
+    'Policy blank state',
+    'Project Alpha',
+    'Readiness Target',
+    'Remote Naming',
+    'Remote Workspace',
+    'Removed Listener Target',
+    'Resume Ownership',
+    'Same ID Cancellation',
+    'Second Bootstrap Project',
+    'Selection Replay B',
+    'Selection Reply',
+    'Source',
+    'Steer Resume',
+    'Suspended blank apply',
+    'Titlebar Safety',
+    'Unrelated Notice Target',
+    'Verified Clear Auto Reset',
+    'Watcher Failure Slices',
+    'Worktree API Smoke',
+    'immediate',
+    'oracle-packaging',
+    'shared-path',
+})
+MAX_FIXTURE_TREE_ENTRIES = 64
+MAX_FIXTURE_FILE_BYTES = 2 * 1024 * 1024
+TEMP_REPO_PATH_RE = re.compile(r"^(?:/private)?/var/folders/")  # class C signal: workspace.json repoPaths only
+# Home paths that leaked fixtures mention without naming a real repo (live store 2026-10-28: the
+# app-support store, plain and percent-encoded, and Codex state). Any other home path excludes C.
+USER_PATH_EXEMPT = (
+    "Library/Application Support/RepoPrompt CE/", "Library/Application%20Support/RepoPrompt%20CE/",
+    ".codex/", ".codex-auth-switcher/",
+)
+SB_FILE_RE = re.compile(r"^windowSessions\.json\.sb-[0-9A-Za-z]{8}-[0-9A-Za-z]{6}$")
+SB_MAX_BYTES = 4096
+CLASS_ORDER = ("A", "B", "C", "P", "S")  # apply order: workspaces before their partitions
 
 APP_PROCESS_PATTERNS = (
     r"RepoPrompt[^/]*\.app/Contents/MacOS/",
@@ -376,7 +483,7 @@ def _collect_agent_recovery(app_support, hard, stores):
     stores.append(_store_record(root, "agentRecovery", "hard", ids, None, {"present": True, "files": counts, "note": "every UUID string in recovery data counts"}))
 
 
-def _collect_partitions(app_support, hard, stores):
+def _collect_partitions(app_support, hard, stores, entries_out=None):
     root = os.path.join(app_support, "Partitions")
     if not _container(root, "Partitions"):
         stores.append({"path": root, "kind": "partitions", "strength": "hard", "present": False})
@@ -398,6 +505,8 @@ def _collect_partitions(app_support, hard, stores):
                         _require(match is not None and entry.is_file(follow_symlinks=False), what, f"unexpected file {repo.name}/{entry.name}")
                         ids.add(match.group(1).upper())
                         files += 1
+                        if entries_out is not None:
+                            entries_out.add(f"{repo.name}/{entry.name}")
     except OSError as error:
         raise ReferenceStoreError(f"{what}: cannot read {root}: {error}") from error
     for workspace_id in ids:
@@ -432,7 +541,7 @@ def _collect_global_settings(app_support, soft, stores):
     stores.append(_store_record(path, "globalSettings", "soft", ids, st, {"present": True, "schemaVersion": version}))
 
 
-def collect_references(app_support: str, workspaces_dir: str):
+def collect_references(app_support: str, workspaces_dir: str, partition_entries=None):
     hard = collections.defaultdict(set)
     soft = collections.defaultdict(set)
     stores = []
@@ -442,9 +551,33 @@ def collect_references(app_support: str, workspaces_dir: str):
     _collect_window_sessions(app_support, hard, stores)
     _collect_mcp_routing(app_support, hard, stores)
     _collect_agent_recovery(app_support, hard, stores)
-    _collect_partitions(app_support, hard, stores)
+    _collect_partitions(app_support, hard, stores, partition_entries)
     _collect_global_settings(app_support, soft, stores)
     return hard, soft, stores
+
+
+def _index_present(stores) -> bool:
+    return any(s.get("kind") == "workspacesIndex" and s.get("present") for s in stores)
+
+
+def _store_home(app_support: str) -> str:
+    """The app-support owner's home; refuses unless this process runs as that owner and it is $HOME."""
+    try:
+        owner = os.stat(app_support).st_uid
+    except OSError as error:
+        raise SystemExit(f"refusing: cannot read app support {app_support!r}: {error}") from None
+    if os.geteuid() != owner:
+        raise SystemExit(f"refusing: running as uid {os.geteuid()}, but {app_support!r} belongs to uid {owner}")
+    try:
+        owner_home = pwd.getpwuid(owner).pw_dir.rstrip("/")
+    except KeyError:
+        raise SystemExit(f"refusing: the owner uid {owner} of {app_support!r} has no passwd entry") from None
+    marker = "/Library/Application Support/"
+    path_home = app_support.split(marker)[0] if marker in app_support else owner_home
+    user_home = os.path.expanduser("~").rstrip("/")
+    if len({os.path.realpath(p) for p in (owner_home, path_home, user_home)}) != 1:
+        raise SystemExit(f"refusing: store home {owner_home!r} (path {path_home!r}) is not $HOME {user_home!r}")
+    return owner_home
 
 
 # --------------------------------------------------------------------------------------
@@ -651,6 +784,217 @@ def classify(workspaces_dir: str, dir_name: str, now_ns: int, hard, soft):
     return result
 
 
+def classify_fixture(workspaces_dir: str, dir_name: str, now_ns: int, hard, soft, home: str | None = None):
+    """Class C: a non-empty leaked unit-test fixture workspace. Never mutates anything."""
+    path = os.path.join(workspaces_dir, dir_name)
+    result = {"dir": dir_name, "class": None, "reason": None}
+    parsed = parse_dir_name(dir_name)
+    if parsed is None or not _is_real_dir(path):
+        result["reason"] = "c_not_workspace_dir"
+        return result
+    name, workspace_id = parsed
+    result.update({"workspaceID": workspace_id, "name": name, "nameGroup": name_group(name)})
+    if result["nameGroup"] not in FIXTURE_NAME_GROUPS:
+        result["reason"] = "c_name_not_fixture"
+        return result
+    kinds = hard.get(workspace_id, set()) - {"partitions"}
+    if kinds:
+        result.update(reason="referenced", detail=sorted(kinds))
+        return result
+    try:
+        tree, overflow = scan_tree(path, MAX_FIXTURE_TREE_ENTRIES)
+    except OSError as error:
+        result.update(reason="scan_failed", detail=str(error))
+        return result
+    if overflow:
+        result["reason"] = "c_too_many_entries"
+        return result
+    wrong_kind = [item[0] for item in tree if item[1] not in ("dir", "file") and not _contained_symlink(path, item)]
+    if wrong_kind:
+        result.update(reason="unexpected_entry_type", detail=wrong_kind[:5])
+        return result
+    if any(item[0] == WORKSPACE_JSON and item[1] != "file" for item in tree):
+        result["reason"] = "workspace_json_not_regular"
+        return result
+    recovery = sorted({m.upper() for item in tree for m in UUID_ANY_RE.findall(item[0])
+                       if "agentRecovery" in hard.get(m.upper(), ())})
+    if recovery:
+        result.update(reason="c_recovery_referenced", detail=recovery[:5])
+        return result
+    too_recent = [item[0] for item in tree if now_ns - item[3] < MIN_AGE_NS]
+    if too_recent:
+        result.update(reason="too_recent", detail=too_recent[:5])
+        return result
+    exempt = "|".join(re.escape(prefix) for prefix in USER_PATH_EXEMPT)
+    user_path = re.compile(re.escape((home or os.path.expanduser("~")).rstrip("/")) + f"/(?!{exempt})")
+    temp_hits, workspace = 0, None
+    for rel, kind, size, _, _ in tree:
+        if kind != "file":
+            continue
+        if size > MAX_FIXTURE_FILE_BYTES:
+            result.update(reason="c_file_too_large", detail=rel)
+            return result
+        try:
+            with open(os.path.join(path, rel), "rb") as handle:
+                text = handle.read().decode("utf-8", "replace").replace("\\/", "/")
+        except OSError as error:
+            result.update(reason="scan_failed", detail=str(error))
+            return result
+        if user_path.search(text):
+            result.update(reason="c_user_path", detail=rel)
+            return result
+        if rel == WORKSPACE_JSON:
+            try:
+                workspace = json.loads(text)
+            except ValueError:
+                workspace = None
+            if not isinstance(workspace, dict):
+                result["reason"] = "workspace_json_unreadable"
+                return result
+    if workspace is not None:
+        if not is_uuid(workspace.get("id")) or workspace["id"].upper() != workspace_id:
+            result["reason"] = "workspace_identity_mismatch"
+            return result
+        if workspace.get("isSystemWorkspace") is not False:
+            result["reason"] = "workspace_system_or_unknown"
+            return result
+        if workspace.get("customStoragePath") is not None:
+            result["reason"] = "workspace_custom_storage"
+            return result
+        repo_paths = workspace.get("repoPaths") if isinstance(workspace.get("repoPaths"), list) else []
+        temp_hits = sum(1 for p in repo_paths if isinstance(p, str) and TEMP_REPO_PATH_RE.match(p))
+        if workspace.get("ephemeralFlag") is not True and temp_hits == 0:
+            result["reason"] = "c_no_fixture_signal"
+            return result
+    result.update({
+        "class": "C",
+        "files": [item[:4] for item in tree],
+        "bytes": sum(item[2] for item in tree if item[1] == "file"),
+        "allocatedBytes": sum(item[4] for item in tree),
+        "tempRepoPaths": temp_hits,
+        "softReferences": sorted(soft.get(workspace_id, ())),
+        "reason": "fixture name group; unreferenced; no user path; fixture signal; all mtimes > 24h",
+    })
+    return result
+
+
+def _contained_symlink(root: str, item) -> bool:
+    """A relative symlink without ".." components: it cannot point outside root (e.g. _git_data CURRENT)."""
+    if item[1] != "symlink":
+        return False
+    try:
+        target = os.readlink(os.path.join(root, item[0]))
+    except OSError:
+        return False
+    return bool(target) and not os.path.isabs(target) and ".." not in target.split("/")
+
+
+def classify_partition_dir(partitions_dir: str, name: str, now_ns: int, candidate_ids, hard=None):
+    """Class P: a Partitions/<repo-key> dir whose every file belongs to one of candidate_ids.
+
+    The dry run passes its class C candidates; --apply passes only the workspaces it has just moved."""
+    path = os.path.join(partitions_dir, name)
+    result = {"dir": name, "class": None, "reason": None, "store": "Partitions", "touchesCandidate": True}
+    if not _is_real_dir(path):
+        result["reason"] = "not_directory"
+        return result
+    try:
+        tree, overflow = scan_tree(path, MAX_FIXTURE_TREE_ENTRIES)
+    except OSError as error:
+        result.update(reason="scan_failed", detail=str(error))
+        return result
+    ids, tabs, unexpected = set(), set(), None
+    for rel, kind, *_ in tree:
+        if rel == "." or os.path.basename(rel) in IGNORABLE_NAMES:
+            continue
+        match = PARTITION_FILE_RE.match(rel)
+        if kind != "file" or match is None:
+            unexpected = unexpected or rel
+            continue
+        ids.add(match.group(1).upper())
+        if match.group(2):
+            tabs.add(match.group(2).upper())
+    result["touchesCandidate"] = bool(ids & candidate_ids)
+    if overflow:
+        result.update(reason="p_too_many_entries", touchesCandidate=True)  # unscanned files may be candidates
+        return result
+    if unexpected:
+        result.update(reason="p_unexpected_entry", detail=unexpected)
+        return result
+    others = sorted(ids - candidate_ids)
+    if not ids or others:
+        result.update(reason="p_not_all_candidates", detail=others[:5])
+        return result
+    hard = hard or {}
+    referenced = sorted(i for i in ids if hard.get(i, set()) - {"partitions"}) + sorted(t for t in tabs if t in hard)
+    if referenced:
+        result.update(reason="p_referenced", detail=referenced[:5])
+        return result
+    too_recent = [item[0] for item in tree if now_ns - item[3] < MIN_AGE_NS]
+    if too_recent:
+        result.update(reason="too_recent", detail=too_recent[:5])
+        return result
+    result.update({
+        "class": "P", "workspaceIDs": sorted(ids), "files": [item[:4] for item in tree],
+        "bytes": sum(item[2] for item in tree if item[1] == "file"), "allocatedBytes": sum(item[4] for item in tree),
+        "reason": "every file belongs to a class C candidate; all mtimes > 24h",
+    })
+    return result
+
+
+def classify_sb_file(app_support: str, name: str, now_ns: int):
+    """Class S: an interrupted atomic-write sibling of windowSessions.json that names no window."""
+    path = os.path.join(app_support, name)
+    result = {"dir": name, "class": None, "reason": None, "store": "appSupport"}
+    if not SB_FILE_RE.match(name):
+        result["reason"] = "s_name"
+        return result
+    try:
+        tree, _ = scan_tree(path)
+        if tree[0][1] != "file":
+            result["reason"] = "not_regular_file"
+            return result
+        if tree[0][2] > SB_MAX_BYTES:
+            result["reason"] = "s_too_large"
+            return result
+        if now_ns - tree[0][3] < MIN_AGE_NS:
+            result["reason"] = "too_recent"
+            return result
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as error:
+        result.update(reason="scan_failed", detail=str(error))
+        return result
+    if raw.strip():
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            result["reason"] = "s_unreadable"
+            return result
+        if not isinstance(document, dict) or document.get("windows") != []:
+            result["reason"] = "s_references_windows"
+            return result
+    result.update({
+        "class": "S", "files": [item[:4] for item in tree], "bytes": tree[0][2], "allocatedBytes": tree[0][4],
+        "reason": "empty or window-less windowSessions.json atomic-write leftover; mtime > 24h",
+    })
+    return result
+
+
+def _source_parent(klass, app_support: str) -> str:
+    return {"P": os.path.join(app_support, "Partitions"), "S": app_support}.get(klass, os.path.join(app_support, "Workspaces"))
+
+
+def _valid_entry_name(klass, name: str) -> bool:
+    if not isinstance(name, str) or name in ("", ".", "..") or os.path.basename(name) != name:
+        return False
+    if klass == "P":
+        return True
+    if klass == "S":
+        return SB_FILE_RE.match(name) is not None
+    return name.startswith(DIR_PREFIX)
+
+
 # --------------------------------------------------------------------------------------
 # Dry run
 # --------------------------------------------------------------------------------------
@@ -681,20 +1025,37 @@ def run_dry(app_support: str, manifest_path: str, now_ns: int | None = None, qui
     if _is_within(manifest_path, app_support):
         raise SystemExit(f"refusing to write the manifest inside {app_support}")
     hard, soft, stores = collect_references(app_support, workspaces_dir)
+    home = _store_home(app_support)
     now_ns = time.time_ns() if now_ns is None else now_ns
     candidates, excluded = [], []
     scanned = 0
+
+    def add(result):
+        if result["class"]:
+            candidates.append(result)
+        else:
+            excluded.append({key: result[key] for key in ("dir", "reason", "detail", "store") if key in result})
+
     with os.scandir(workspaces_dir) as entries:
         for entry in entries:
             scanned += 1
             result = classify(workspaces_dir, entry.name, now_ns, hard, soft)
-            if result["class"]:
-                candidates.append(result)
-            else:
-                record = {"dir": result["dir"], "reason": result["reason"]}
-                if "detail" in result:
-                    record["detail"] = result["detail"]
-                excluded.append(record)
+            if not result["class"]:
+                fixture = classify_fixture(workspaces_dir, entry.name, now_ns, hard, soft, home)
+                if fixture["class"] or fixture["reason"] not in ("c_name_not_fixture", "c_not_workspace_dir"):
+                    result = fixture
+            add(result)
+    candidate_ids = {c["workspaceID"] for c in candidates if c["class"] == "C"}
+    if candidate_ids and not _index_present(stores):
+        raise ReferenceStoreError("workspacesIndex.json is missing; classes C and P need it to protect indexed workspaces")
+    partitions_dir = os.path.join(app_support, "Partitions")
+    if _is_real_dir(partitions_dir):
+        for name in sorted(n for n in os.listdir(partitions_dir) if n not in IGNORABLE_NAMES):
+            result = classify_partition_dir(partitions_dir, name, now_ns, candidate_ids, hard)
+            if result.pop("touchesCandidate") or result["class"]:
+                add(result)  # report partition dirs holding a class C candidate's file or failing to scan
+    for name in sorted(n for n in os.listdir(app_support) if n.startswith("windowSessions.json.sb-")):
+        add(classify_sb_file(app_support, name, now_ns))
     candidates.sort(key=lambda c: c["dir"])
     excluded.sort(key=lambda c: c["dir"])
     summary = summarize(candidates, excluded, stores, scanned, time.monotonic() - started)
@@ -703,6 +1064,7 @@ def run_dry(app_support: str, manifest_path: str, now_ns: int | None = None, qui
         "generatedAt": _dt.datetime.fromtimestamp(now_ns / 1e9, _dt.timezone.utc).isoformat(),
         "generatedAtNs": now_ns,
         "appSupport": app_support,
+        "home": home,
         "workspacesDir": workspaces_dir,
         "workspacesDev": os.stat(workspaces_dir).st_dev,
         "minAgeHours": MIN_AGE_NS / 3.6e12,
@@ -720,20 +1082,22 @@ def run_dry(app_support: str, manifest_path: str, now_ns: int | None = None, qui
 
 def summarize(candidates, excluded, stores, scanned, seconds):
     by_class = {}
-    for klass in ("A", "B"):
+    for klass in CLASS_ORDER:
         members = [c for c in candidates if c["class"] == klass]
-        combos = collections.Counter("+".join(c["emptyDirs"]) or "(none)" for c in members)
+        combos = collections.Counter("+".join(c.get("emptyDirs", ())) or "(none)" for c in members)
         by_class[klass] = {
             "count": len(members),
+            "files": sum(1 for c in members for item in c.get("files", ()) if item[1] == "file"),
             "bytes": sum(c["bytes"] for c in members),
             "allocatedBytes": sum(c["allocatedBytes"] for c in members),
-            "softReferencedGlobalSettings": sum(1 for c in members if "globalSettings" in c["softReferences"]),
+            "softReferencedGlobalSettings": sum(1 for c in members if "globalSettings" in c.get("softReferences", ())),
             "emptyDirCombos": dict(combos.most_common()),
         }
-    groups = collections.defaultdict(lambda: {"A": 0, "B": 0})
+    groups = collections.defaultdict(collections.Counter)
     for c in candidates:
-        groups[c["nameGroup"]][c["class"]] += 1
-    top = sorted(groups.items(), key=lambda kv: (-(kv[1]["A"] + kv[1]["B"]), kv[0]))[:30]
+        if "nameGroup" in c:
+            groups[c["nameGroup"]][c["class"]] += 1
+    top = sorted(groups.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))[:30]
     reasons = collections.Counter(e["reason"] for e in excluded)
     referenced_by = collections.Counter()
     for e in excluded:
@@ -746,7 +1110,7 @@ def summarize(candidates, excluded, stores, scanned, seconds):
         "classes": by_class,
         "excludedByReason": dict(reasons.most_common()),
         "referencedByStore": dict(referenced_by.most_common()),
-        "topNameGroups": [{"group": g, "A": v["A"], "B": v["B"], "total": v["A"] + v["B"]} for g, v in top],
+        "topNameGroups": [{"group": g, "A": v["A"], "B": v["B"], "C": v["C"], "total": sum(v.values())} for g, v in top],
         "referenceStores": [{k: s[k] for k in ("kind", "strength", "path", "workspaceIDs", "present") if k in s} for s in stores],
     }
 
@@ -767,12 +1131,14 @@ def print_summary(summary, manifest_path):
         state = f"{store.get('workspaceIDs', 0)} workspace IDs" if store.get("present", True) else "absent"
         print(f"  [{store['strength']}] {store['kind']}: {state}  ({store['path']})")
     for klass, info in summary["classes"].items():
+        count = f"{info['count']} files" if klass == "S" else f"{info['count']} dirs ({info['files']} files)"
         print(
-            f"Class {klass}: {info['count']} dirs, {_human(info['bytes'])} logical, "
+            f"Class {klass}: {count}, {_human(info['bytes'])} logical, "
             f"{_human(info['allocatedBytes'])} allocated, {info['softReferencedGlobalSettings']} also in globalSettings"
         )
-        for combo, count in info["emptyDirCombos"].items():
-            print(f"    empty dirs {combo}: {count}")
+        if klass in ("A", "B"):
+            for combo, count in info["emptyDirCombos"].items():
+                print(f"    empty dirs {combo}: {count}")
     print("Excluded by reason:")
     for reason, count in summary["excludedByReason"].items():
         print(f"  {count:7d}  {reason}")
@@ -780,7 +1146,7 @@ def print_summary(summary, manifest_path):
         print("  referenced, by store: " + ", ".join(f"{k}={v}" for k, v in summary["referencedByStore"].items()))
     print("Top name groups (candidates):")
     for group in summary["topNameGroups"]:
-        print(f"  {group['total']:7d}  A={group['A']:<6d} B={group['B']:<5d} {group['group']}")
+        print(f"  {group['total']:7d}  A={group['A']:<6d} B={group['B']:<5d} C={group['C']:<6d} {group['group']}")
 
 
 # --------------------------------------------------------------------------------------
@@ -893,8 +1259,15 @@ class _ExclusiveLock:
 
 
 def _reference_fingerprint(hard, stores):
-    ids = tuple(sorted((workspace_id, tuple(sorted(kinds))) for workspace_id, kinds in hard.items()))
-    return ids, tuple(sorted(json.dumps(store, sort_keys=True) for store in stores))
+    """Hard references and store metadata except Partitions, which _RunGuard compares file by file."""
+    ids = tuple(sorted((workspace_id, tuple(sorted(kinds - {"partitions"})))
+                       for workspace_id, kinds in hard.items() if kinds - {"partitions"}))
+    records = []
+    for store in stores:
+        if store.get("kind") == "partitions":
+            store = {k: v for k, v in store.items() if k not in ("workspaceIDs", "files")}
+        records.append(json.dumps(store, sort_keys=True))
+    return ids, tuple(sorted(records))
 
 
 class _RunGuard:
@@ -902,6 +1275,8 @@ class _RunGuard:
 
     def __init__(self, app_support, workspaces_dir, process_check, check_every, check_seconds, hooks):
         self.app_support = app_support
+        self.stores = None
+        self.partition_entries = None
         self.workspaces_dir = workspaces_dir
         self.process_check = process_check
         self.check_every = check_every
@@ -915,10 +1290,21 @@ class _RunGuard:
 
     def start(self):
         refuse_if_app_running(self.process_check)
-        hard, soft, stores = collect_references(self.app_support, self.workspaces_dir)
-        self.baseline = _reference_fingerprint(hard, stores)
+        entries = set()
+        hard, soft, self.stores = collect_references(self.app_support, self.workspaces_dir, entries)
+        self.baseline = _reference_fingerprint(hard, self.stores)
+        self.partition_entries = entries  # expected Partitions files; only note_partition_dir changes it
         self.last_count, self.last_time = 0, time.monotonic()
         return hard, soft
+
+    def note_partition_dir(self, dir_name, files, present: bool):
+        """This run moved (present=False) or restored (present=True) exactly these files of Partitions/dir_name."""
+        names = {f"{dir_name}/{item[0]}" for item in files or ()
+                 if item[1] == "file" and PARTITION_FILE_RE.match(str(item[0]))}
+        if present:
+            self.partition_entries |= names
+        else:
+            self.partition_entries -= names
 
     def poll(self, count: int):
         """Run the periodic check when due (every check_every moves or check_seconds); return a stop reason or None."""
@@ -937,11 +1323,12 @@ class _RunGuard:
                 self.detail = str(error)
                 return "stopped_process_check_failed"
             try:
-                hard, _, stores = collect_references(self.app_support, self.workspaces_dir)
+                entries = set()
+                hard, _, stores = collect_references(self.app_support, self.workspaces_dir, entries)
             except ReferenceStoreError as error:
                 self.detail = str(error)
                 return "stopped_reference_store_error"
-            if _reference_fingerprint(hard, stores) != self.baseline:
+            if _reference_fingerprint(hard, stores) != self.baseline or entries != self.partition_entries:
                 return "stopped_references_changed"
             return None
         finally:
@@ -959,10 +1346,15 @@ def run_apply(app_support, manifest_path, classes, process_check=running_app_pro
         raise SystemExit("refusing: unknown manifest schema")
     if os.path.abspath(manifest.get("appSupport", "")) != app_support:
         raise SystemExit(f"refusing: manifest is for {manifest.get('appSupport')!r}, not {app_support!r}")
+    home = _store_home(app_support)
+    if "C" in classes and manifest.get("home") != home:
+        raise SystemExit(f"refusing: manifest home {manifest.get('home')!r} is not {home!r}; run a fresh --dry-run")
     rename = hooks.get("rename", os.rename)
     with _ExclusiveLock(app_support):
         guard = _RunGuard(app_support, workspaces_dir, process_check, check_every, check_seconds, hooks)
         hard, soft = guard.start()
+        if set(classes) & {"C", "P"} and not _index_present(guard.stores):
+            raise SystemExit("refusing: workspacesIndex.json is missing; classes C and P need it")
         stamp = hooks.get("stamp") or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         quarantine_dir = os.path.join(app_support, f"Workspaces-Quarantine-{stamp}")
         os.mkdir(quarantine_dir)  # FileExistsError aborts; never reuses a quarantine directory
@@ -979,25 +1371,33 @@ def run_apply(app_support, manifest_path, classes, process_check=running_app_pro
                 "classes": sorted(classes), "startedAt": stamp,
             }, sync=True)
             _fsync_dir(quarantine_dir)
-            for candidate in manifest.get("candidates", []):
-                if candidate.get("class") not in classes:
-                    continue
-                dir_name = candidate.get("dir", "")
-                if not isinstance(dir_name, str) or os.path.basename(dir_name) != dir_name or not dir_name.startswith(DIR_PREFIX):
+            moved_c_ids = set()  # class P needs every workspace of the folder moved as C by this invocation
+            selected = [c for c in manifest.get("candidates", []) if c.get("class") in classes]
+            for candidate in sorted(selected, key=lambda c: CLASS_ORDER.index(c["class"])):
+                klass, dir_name = candidate["class"], candidate.get("dir", "")
+                if not _valid_entry_name(klass, dir_name):
                     skipped["invalid_manifest_entry"] += 1
                     continue
                 stopped = guard.poll(moved)
                 if stopped:
                     skipped[stopped] += 1
                     break
-                fresh = classify(workspaces_dir, dir_name, now_ns, hard, soft)
+                parent = _source_parent(klass, app_support)
+                if klass in ("A", "B"):
+                    fresh = classify(parent, dir_name, now_ns, hard, soft)
+                elif klass == "C":
+                    fresh = classify_fixture(parent, dir_name, now_ns, hard, soft, home)
+                elif klass == "S":
+                    fresh = classify_sb_file(parent, dir_name, now_ns)
+                else:
+                    fresh = classify_partition_dir(parent, dir_name, now_ns, moved_c_ids, hard)
                 if fresh["class"] is None:
                     skipped["revalidation:" + str(fresh["reason"])] += 1
                     continue
                 if fresh["class"] != candidate["class"] or fresh["files"] != candidate.get("files"):
                     skipped["revalidation:changed_since_manifest"] += 1
                     continue
-                source = os.path.join(workspaces_dir, dir_name)
+                source = os.path.join(parent, dir_name)
                 target = os.path.join(quarantine_dir, dir_name)
                 if os.path.lexists(target):
                     skipped["target_exists"] += 1
@@ -1027,6 +1427,10 @@ def run_apply(app_support, manifest_path, classes, process_check=running_app_pro
                         break
                     continue
                 moved += 1
+                if klass == "C":
+                    moved_c_ids.add(fresh["workspaceID"])
+                elif klass == "P":
+                    guard.note_partition_dir(dir_name, fresh["files"], present=False)
                 if "after_rename" in hooks:
                     hooks["after_rename"](dir_name)
                 try:
@@ -1041,14 +1445,20 @@ def run_apply(app_support, manifest_path, classes, process_check=running_app_pro
             except OSError as error:
                 skipped[f"final_journal_fsync_failed:{_errno_name(error)}"] += 1
         _fsync_dir(quarantine_dir)
-        _fsync_dir(workspaces_dir)
+        for parent in {workspaces_dir} | {_source_parent(klass, app_support) for klass in classes}:
+            _fsync_dir(parent)
         result = {"quarantineDir": quarantine_dir, "restoreManifest": restore_path, "moved": moved,
                   "skipped": dict(skipped), "stopped": stopped, "periodicChecks": guard.checks}
         if guard.detail:
             result["stopDetail"] = guard.detail
         _atomic_write_json(os.path.join(quarantine_dir, "apply-summary.json"), result)
     if stopped and not quiet:
-        print(f"stopping early ({stopped}); everything moved so far is journaled in {restore_path}", file=sys.stderr)
+        print(f"stopping early ({stopped}); everything moved so far is journaled in {restore_path}.\n"
+              f"Quit the cause, then re-run --apply --manifest {os.path.abspath(manifest_path)} with the same --class values;"
+              " class P folders of workspaces this run moved stay put unless you --restore this journal first."
+              " Expect what this run moved to be skipped as revalidation:c_not_workspace_dir / :not_directory /"
+              " :scan_failed / :missing.",
+              file=sys.stderr)
     if not quiet:
         print(json.dumps(result, indent=1))
     return result
@@ -1129,15 +1539,17 @@ def run_restore(restore_path, process_check=running_app_processes, quiet=False,
             entry = entries[dir_name]
             record, state = entry["record"], entry["state"]
             source, target = os.path.abspath(record["to"]), os.path.abspath(record["from"])
-            if (os.path.dirname(source) != quarantine_dir or os.path.dirname(target) != workspaces_dir
-                    or os.path.basename(source) != dir_name or os.path.basename(target) != dir_name):
+            klass = record.get("class")
+            if (os.path.dirname(source) != quarantine_dir or os.path.dirname(target) != _source_parent(klass, app_support)
+                    or os.path.basename(source) != dir_name or os.path.basename(target) != dir_name
+                    or not _valid_entry_name(klass, dir_name)):
                 skipped["path_outside_stores"] += 1
                 continue
             if os.path.lexists(target):
                 # Intent-only/failed entries whose origin is still in place were never moved.
                 skipped["destination_exists" if state == "moved" or os.path.lexists(source) else "not_moved"] += 1
                 continue
-            if not _is_real_dir(source):
+            if not ((os.path.isfile(source) and not os.path.islink(source)) if klass == "S" else _is_real_dir(source)):
                 skipped["quarantined_entry_missing"] += 1
                 continue
             stopped = guard.poll(restored)
@@ -1152,13 +1564,17 @@ def run_restore(restore_path, process_check=running_app_processes, quiet=False,
             restored += 1
             if state != "moved":
                 reconciled += 1
+            tree = record.get("files")
             try:
-                tree, _ = scan_tree(target)
-                if [item[:4] for item in tree] != record.get("files"):
+                tree, overflow = scan_tree(target, MAX_FIXTURE_TREE_ENTRIES if klass in ("C", "P") else MAX_TREE_ENTRIES)
+                if overflow or [item[:4] for item in tree] != record.get("files"):
                     changed.append(dir_name)
             except OSError:
                 changed.append(dir_name)
-        _fsync_dir(workspaces_dir)
+            if klass == "P":
+                guard.note_partition_dir(dir_name, tree, present=True)
+        for parent in {workspaces_dir} | {_source_parent(entries[d]["record"].get("class"), app_support) for d in order}:
+            _fsync_dir(parent)
     result = {"restored": restored, "reconciledInterrupted": reconciled, "skipped": dict(skipped),
               "changedWhileQuarantined": changed[:50], "changedCount": len(changed),
               "truncatedTrailingLine": bad_trailing, "stopped": stopped, "periodicChecks": guard.checks}
@@ -1524,8 +1940,235 @@ def _self_test() -> int:
         # Manifest inside app support is refused.
         _expect_raises((SystemExit, ReferenceStoreError), lambda: run_dry(app, os.path.join(app, "m.json"), quiet=True),
                        "manifest inside app support accepted")
-    print(f"self-test passed ({len(cases)} malformed-container cases)")
+    _self_test_fixture_classes()
+    print(f"self-test passed ({len(cases)} malformed-container cases; classes C, P, S)")
     return 0
+
+
+def _self_test_fixture_classes() -> None:
+    """Classes C, P and S on their own temporary store (moved, excluded, restored)."""
+    old_ns = time.time_ns() - 3 * MIN_AGE_NS
+    home = os.path.expanduser("~")
+
+    def uid(n):
+        return f"{n:08X}-0000-4000-8000-{n:012X}"
+
+    def write(path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(payload if isinstance(payload, str) else json.dumps(payload))
+
+    with tempfile.TemporaryDirectory(prefix="rpce-quarantine-selftest-cps-") as tmp:
+        app = os.path.join(tmp, "RepoPrompt CE")
+        ws, parts = os.path.join(app, "Workspaces"), os.path.join(app, "Partitions")
+        temp_doc = {"fileURL": "file:///var/folders/xy/T/fixture"}
+
+        def session(n):
+            return {f"AgentSessions/AgentSession-{uid(n)}.json": temp_doc}
+
+        # Exempt home paths only; 30 chats push the tree past MAX_TREE_ENTRIES (restore must still match).
+        exempt_doc = {"store": home + "/Library/Application%20Support/RepoPrompt%20CE/Workspaces/x",
+                      "plain": home + "/Library/Application Support/RepoPrompt CE/Partitions/y",
+                      "auth": home + "/.codex-auth-switcher/a", "codex": home + "/.codex/sessions/b"}
+        chats = {f"Chats/Chat-{n:02d}.json": exempt_doc for n in range(30)}
+        dirs = {
+            "ok": (f"Workspace-Remote Naming-{uid(101)}", {**session(201), INDEX_REL: {"entries": [{}]}, **chats}),
+            "index": (f"Workspace-Project Alpha-{uid(102)}", session(202)),
+            "window": (f"Workspace-Project Alpha-{uid(103)}", session(203)),
+            "mcp": (f"Workspace-Project Alpha-{uid(104)}", session(204)),
+            "recovery": (f"Workspace-Project Alpha-{uid(105)}", session(205)),
+            "user": (f"Workspace-Remote Workspace-{uid(106)}", {WORKSPACE_JSON: {
+                "id": uid(106), "ephemeralFlag": True, "isSystemWorkspace": False, "repoPaths": [home + "/workspace/real"]}}),
+            "real": (f"Workspace-Remote Naming-{uid(107)}", {WORKSPACE_JSON: {
+                "id": uid(107), "ephemeralFlag": False, "isSystemWorkspace": False, "repoPaths": []}}),
+            "name": (f"Workspace-My Project-{uid(108)}", session(208)),
+            "escape": (f"Workspace-Remote Naming-{uid(109)}", session(209)),
+        }
+        for name, files in dirs.values():
+            for rel, payload in files.items():
+                write(os.path.join(ws, name, rel), payload)
+        write(os.path.join(ws, dirs["ok"][0], "_git_data", "repos", "r", "2026-07-02", "1059", "HEAD"), "x")
+        os.symlink("2026-07-02/1059", os.path.join(ws, dirs["ok"][0], "_git_data", "repos", "r", "CURRENT"))
+        os.symlink("../../outside", os.path.join(ws, dirs["escape"][0], "CURRENT"))
+        write(os.path.join(ws, "workspacesIndex.json"),
+              [{"id": uid(102), "name": "Project Alpha", "isSystemWorkspace": False, "isHiddenInMenus": False}])
+        write(os.path.join(app, "windowSessions.json"), {"version": 4, "windows": [
+            {"windowKind": "standard", "workspaceID": uid(103), "isSystemWorkspace": False, "isEphemeral": False, "lastFocused": True}]})
+        write(os.path.join(app, "MCP", "mcp-routing.json"), {"records": {"client": [{"lastWorkspaceID": uid(104)}]}})
+        write(os.path.join(app, "AgentRecovery", "v1", "sessions", f"{uid(205)}.json"), {"schemaVersion": 1, "sessionID": uid(205)})
+        p_ok, p_mixed = "fixture-root-aaaaaaaaaaaa", "shared-root-bbbbbbbbbbbb"
+        write(os.path.join(parts, p_ok, f"filepartitions-{uid(101).lower()}.json"), "{}")
+        write(os.path.join(parts, p_mixed, f"filepartitions-{uid(101).lower()}-{uid(301).lower()}.json"), "{}")
+        write(os.path.join(parts, p_mixed, f"filepartitions-{uid(102).lower()}.json"), "{}")
+        p_tab = "tab-root-cccccccccccc"  # a fixture's file whose tab UUID is window-referenced
+        write(os.path.join(parts, p_tab, f"filepartitions-{uid(101).lower()}-{uid(103).lower()}.json"), "{}")
+        sb_empty, sb_no_windows, sb_windows = (f"windowSessions.json.sb-1234abcd-{s}" for s in ("Ab12Cd", "Ef34Gh", "Ij56Kl"))
+        write(os.path.join(app, sb_empty), "")
+        write(os.path.join(app, sb_no_windows), {"version": 4, "windows": []})
+        write(os.path.join(app, sb_windows), {"version": 4, "windows": [{"workspaceID": uid(103)}]})
+        for current, subdirs, names in os.walk(app, topdown=False):
+            for n in names:
+                os.utime(os.path.join(current, n), ns=(old_ns, old_ns), follow_symlinks=False)
+            for n in subdirs:  # also the symlink to a directory, which os.walk lists here
+                os.utime(os.path.join(current, n), ns=(old_ns, old_ns), follow_symlinks=False)
+            os.utime(current, ns=(old_ns, old_ns))
+
+        manifest_path = os.path.join(tmp, "manifest.json")
+        manifest = run_dry(app, manifest_path, quiet=True)
+        got = {c["dir"]: c["class"] for c in manifest["candidates"]}
+        reasons = {e["dir"]: e["reason"] for e in manifest["excluded"]}
+        _check(got == {dirs["ok"][0]: "C", p_ok: "P", sb_empty: "S", sb_no_windows: "S"}, (got, reasons))
+        for key, reason in (("index", "referenced"), ("window", "referenced"), ("mcp", "referenced"),
+                            ("recovery", "c_recovery_referenced"), ("user", "c_user_path"),
+                            ("real", "c_no_fixture_signal"), ("name", "has_agent_sessions"),
+                            ("escape", "unexpected_entry_type")):
+            _check(reasons[dirs[key][0]] == reason, (key, reasons))
+        _check(reasons[p_mixed] == "p_not_all_candidates" and reasons[sb_windows] == "s_references_windows", reasons)
+        _check(reasons[p_tab] == "p_referenced", reasons)
+        ok_files = next(c["files"] for c in manifest["candidates"] if c["dir"] == dirs["ok"][0])
+        _check(MAX_TREE_ENTRIES < len(ok_files) <= MAX_FIXTURE_TREE_ENTRIES, len(ok_files))
+        _check(manifest["home"] == home.rstrip("/"), manifest.get("home"))
+        _expect_raises(SystemExit, lambda: _store_home(os.path.join(tmp, "missing")), "missing app support accepted")
+        real_geteuid, real_getpwuid = os.geteuid, pwd.getpwuid
+        try:
+            os.geteuid = lambda: real_geteuid() + 1
+            _expect_raises(SystemExit, lambda: _store_home(app), "store of another uid accepted (sudo)")
+            os.geteuid = real_geteuid
+
+            def no_entry(uid_):
+                raise KeyError(uid_)
+
+            pwd.getpwuid = no_entry
+            _expect_raises(SystemExit, lambda: _store_home(app), "owner without passwd entry accepted")
+        finally:
+            os.geteuid, pwd.getpwuid = real_geteuid, real_getpwuid
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = tmp
+        try:
+            _expect_raises(SystemExit, lambda: run_dry(app, os.path.join(tmp, "m2.json"), quiet=True),
+                           "dry run accepted a $HOME that is not the store owner's home")
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+
+        no_proc = lambda: []  # noqa: E731
+        # A partitions dir is not moved while its fixture workspace is still in Workspaces/.
+        result = run_apply(app, manifest_path, {"P"}, process_check=no_proc, quiet=True, hooks={"stamp": "selftest-cps-1"})
+        _check(result["moved"] == 0 and result["skipped"] == {"revalidation:p_not_all_candidates": 1}, result)
+        # The C workspace is renamed away and its UUID indexed before apply: its partitions do not move.
+        ok_path, renamed = os.path.join(ws, dirs["ok"][0]), os.path.join(ws, f"Workspace-Renamed-{uid(101)}")
+        index_path = os.path.join(ws, "workspacesIndex.json")
+        with open(index_path, encoding="utf-8") as handle:
+            index = json.load(handle)
+        os.rename(ok_path, renamed)
+        write(index_path, index + [{"id": uid(101), "name": "Renamed", "isSystemWorkspace": False, "isHiddenInMenus": False}])
+        result = run_apply(app, manifest_path, {"C", "P"}, process_check=no_proc, quiet=True, hooks={"stamp": "selftest-cps-1b"})
+        _check(result["moved"] == 0 and result["skipped"] == {"revalidation:c_not_workspace_dir": 1,
+                                                               "revalidation:p_not_all_candidates": 1}, result)
+        os.rename(renamed, ok_path)
+        write(index_path, index)
+        # Unexpected Partitions changes mid-run stop the apply: another workspace's file is added, or
+        # swapped for a file of a new workspace (same file count).
+        real_file = os.path.join(parts, p_mixed, f"filepartitions-{uid(102).lower()}.json")
+        extra = os.path.join(parts, p_mixed, f"filepartitions-{uid(102).lower()}-{uid(302).lower()}.json")
+        swapped = os.path.join(parts, p_mixed, f"filepartitions-{uid(303).lower()}.json")
+        for stamp, change, undo in (("1c", lambda: write(extra, "{}"), lambda: os.unlink(extra)),
+                                    ("1d", lambda: os.rename(real_file, swapped), lambda: os.rename(swapped, real_file))):
+            done = []
+
+            def change_once(count, change=change, done=done):
+                if count >= 1 and not done:
+                    done.append(change())
+
+            result = run_apply(app, manifest_path, {"C", "P", "S"}, process_check=no_proc, quiet=True, check_every=1,
+                               hooks={"stamp": "selftest-cps-" + stamp, "periodic_check": change_once})
+            _check(result["stopped"] == "stopped_references_changed" and result["moved"] == 1, (stamp, result))
+            restored = run_restore(result["restoreManifest"], process_check=no_proc, quiet=True)
+            _check(restored["restored"] == 1 and restored["changedCount"] == 0 and restored["skipped"] == {}, restored)
+            undo()
+        # Moved fixture UUID 101 gains a file in the retained mixed folder after its own P folder moved.
+        tab_file = os.path.join(parts, p_mixed, f"filepartitions-{uid(101).lower()}-{uid(304).lower()}.json")
+        tab_file2 = os.path.join(parts, p_mixed, f"filepartitions-{uid(101).lower()}-{uid(305).lower()}.json")
+
+        def add_once(path, at_count):
+            def hook(count):
+                if count >= at_count and not os.path.exists(path):
+                    write(path, "{}")
+            return hook
+
+        first = run_apply(app, manifest_path, {"C", "P", "S"}, process_check=no_proc, quiet=True, check_every=1,
+                          hooks={"stamp": "selftest-cps-1e", "periodic_check": add_once(tab_file, 2)})
+        _check(first["stopped"] == "stopped_references_changed" and first["moved"] == 2, first)
+        # Re-runs with the same manifest skip what the stopped run moved, with the documented reasons.
+        second = run_apply(app, manifest_path, {"C", "P", "S"}, process_check=no_proc, quiet=True, hooks={"stamp": "selftest-cps-1f"})
+        _check(second["moved"] == 2 and second["skipped"] == {"revalidation:c_not_workspace_dir": 1,
+                                                              "revalidation:not_directory": 1}, second)
+        third = run_apply(app, manifest_path, {"C", "P", "S"}, process_check=no_proc, quiet=True, hooks={"stamp": "selftest-cps-1g"})
+        _check(third["moved"] == 0 and third["skipped"] == {"revalidation:c_not_workspace_dir": 1, "revalidation:not_directory": 1,
+                                                            "revalidation:scan_failed": 2}, third)
+        _check(run_restore(second["restoreManifest"], process_check=no_proc, quiet=True)["restored"] == 2, "sb restore")
+        # The same kind of change during restore stops it; a re-run finishes the restore.
+        restored = run_restore(first["restoreManifest"], process_check=no_proc, quiet=True, check_every=1,
+                               hooks={"periodic_check": add_once(tab_file2, 1)})
+        _check(restored["stopped"] == "stopped_references_changed" and restored["restored"] == 1, restored)
+        os.unlink(tab_file2)
+        restored = run_restore(first["restoreManifest"], process_check=no_proc, quiet=True)
+        _check(restored["restored"] == 1 and restored["changedCount"] == 0 and restored["skipped"] == {"destination_exists": 1}, restored)
+        os.unlink(tab_file)
+
+        moved = [os.path.join(ws, dirs["ok"][0]), os.path.join(parts, p_ok), os.path.join(app, sb_empty), os.path.join(app, sb_no_windows)]
+        kept = [os.path.join(ws, d) for key, (d, _) in dirs.items() if key != "ok"]
+        kept += [os.path.join(parts, p_mixed), os.path.join(app, sb_windows)]
+        # Periodic checks on every move must not read the class P moves as a reference change.
+        result = run_apply(app, manifest_path, {"C", "P", "S"}, process_check=no_proc, quiet=True, check_every=1,
+                           hooks={"stamp": "selftest-cps-2"})
+        _check(result["moved"] == 4 and result["skipped"] == {} and result["stopped"] is None and result["periodicChecks"] >= 3, result)
+        _check(not any(os.path.lexists(p) for p in moved) and all(os.path.lexists(p) for p in kept), "C/P/S apply moved the wrong entries")
+        restored = run_restore(result["restoreManifest"], process_check=no_proc, quiet=True, check_every=1)
+        _check(restored["restored"] == 4 and restored["changedCount"] == 0 and restored["skipped"] == {}
+               and restored["stopped"] is None, restored)
+        _check(_is_real_dir(moved[0]) and _is_real_dir(moved[1]) and all(os.path.isfile(p) for p in moved[2:]),
+               "C/P/S restore incomplete")
+        _check(os.path.isfile(os.path.join(moved[0], "_git_data", "repos", "r", "CURRENT", "HEAD")), "restored symlink broken")
+        # Without workspacesIndex.json, classes C and P refuse (dry run and apply).
+        os.unlink(index_path)
+        _expect_raises(ReferenceStoreError, lambda: run_dry(app, os.path.join(tmp, "m3.json"), quiet=True),
+                       "dry run produced class C without workspacesIndex.json")
+        _expect_raises(SystemExit, lambda: run_apply(app, manifest_path, {"C"}, process_check=no_proc, quiet=True,
+                                                     hooks={"stamp": "selftest-cps-4"}), "apply ran without workspacesIndex.json")
+        _check(not os.path.exists(os.path.join(app, "Workspaces-Quarantine-selftest-cps-4")), "refused apply left a quarantine dir")
+
+        # Single-directory class C rules, classified directly.
+        unit_ws = os.path.join(tmp, "unit", "Workspaces")
+
+        def descriptor(n, ephemeral, repo_paths, **extra):
+            return {WORKSPACE_JSON: {"id": uid(n), "ephemeralFlag": ephemeral, "isSystemWorkspace": False,
+                                     "repoPaths": repo_paths, **extra}}
+
+        units = {
+            "var_folders": (401, descriptor(401, False, ["/private/var/folders/xy/T/repo"]), None, "C"),
+            "tmp_repo": (402, descriptor(402, False, ["/tmp/repo"]), None, "c_no_fixture_signal"),
+            "temp_in_text_only": (403, {**descriptor(403, False, []), **session(403)}, None, "c_no_fixture_signal"),
+            "dot_config": (404, descriptor(404, True, [home + "/.config/real-repo"]), None, "c_user_path"),
+            "cloud_storage": (405, descriptor(405, True, [home + "/Library/CloudStorage/Dropbox/repo"]), None, "c_user_path"),
+            "json_dir": (406, {WORKSPACE_JSON + "/inner.json": "{}"}, None, "workspace_json_not_regular"),
+            "json_symlink": (407, {"real.json": descriptor(407, True, [], isSystemWorkspace=True)[WORKSPACE_JSON]},
+                             "real.json", "workspace_json_not_regular"),
+        }
+        for key, (n, files, link_target, _) in units.items():
+            root = os.path.join(unit_ws, f"Workspace-Remote Naming-{uid(n)}")
+            for rel, payload in files.items():
+                write(os.path.join(root, rel), payload)
+            if link_target:
+                os.symlink(link_target, os.path.join(root, WORKSPACE_JSON))
+        for current, subdirs, names in os.walk(unit_ws, topdown=False):
+            for n in names + subdirs:
+                os.utime(os.path.join(current, n), ns=(old_ns, old_ns), follow_symlinks=False)
+        for key, (n, _, _, expected) in units.items():
+            fresh = classify_fixture(unit_ws, f"Workspace-Remote Naming-{uid(n)}", time.time_ns(), {}, {}, home)
+            _check((fresh["class"] or fresh["reason"]) == expected, (key, fresh["reason"], fresh.get("detail")))
 
 
 # --------------------------------------------------------------------------------------
@@ -1540,7 +2183,7 @@ def main(argv=None) -> int:
     mode.add_argument("--restore", metavar="RESTORE_MANIFEST", help="move entries of a restore-manifest.jsonl back")
     mode.add_argument("--self-test", action="store_true", help="run the built-in self-test on a temporary store")
     parser.add_argument("--manifest", help="dry-run output / apply input manifest path")
-    parser.add_argument("--class", dest="classes", action="append", choices=("A", "B"),
+    parser.add_argument("--class", dest="classes", action="append", choices=CLASS_ORDER,
                         help="apply only: candidate class to move (repeatable; required)")
     parser.add_argument("--app-support", default=DEFAULT_APP_SUPPORT, help="RepoPrompt CE app-support root")
     args = parser.parse_args(argv)
