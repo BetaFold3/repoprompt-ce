@@ -705,6 +705,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10b-review-oracleb-r1.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10b-review-oraclea-r2.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10b-review-oracleb-r2.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10b-live-apply.md"
   "docs/context/review-policy.md"
   "docs/context/plans/completed/2026-10-04-swift-build-measurement-and-debug-dsym-plan.md"
   "docs/context/plans/completed/2026-10-08-swift-compile-follow-ups-plan.md"
